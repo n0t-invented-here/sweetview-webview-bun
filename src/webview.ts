@@ -720,13 +720,15 @@ export class Webview {
    * {@link completeWebviewRequest} does.
    */
   completeRequest(id: bigint, response: WebviewResponse = {}) {
-    checkStatus("webview_complete_request", response.status ?? 200);
+    // Read once: the value checked is the value sent, even from a getter.
+    const status = response.status ?? 200;
+    checkStatus("webview_complete_request", status);
     if (!this.#handle) {
       // Same answer the library gives completeWebviewRequest on a destroyed
       // handle: WEBVIEW_ERROR_INVALID_STATE.
       throw new WebviewError("webview_complete_request", -3);
     }
-    completeWebviewRequest(this.#handle, id, response);
+    completeWebviewRequest(this.#handle, id, { ...response, status });
   }
 
   /**
@@ -736,8 +738,13 @@ export class Webview {
    * {@link Webview.unsafeHandle}.
    */
   beginResponse(id: bigint, head: WebviewResponseHead = {}) {
-    checkStatus("webview_begin_response", head.status ?? 200);
-    beginWebviewResponse(this.#liveHandle("webview_begin_response"), id, head);
+    // Read once: the value checked is the value sent, even from a getter.
+    const status = head.status ?? 200;
+    checkStatus("webview_begin_response", status);
+    beginWebviewResponse(this.#liveHandle("webview_begin_response"), id, {
+      ...head,
+      status,
+    });
   }
 
   /** Appends a body chunk; see {@link writeWebviewResponseChunk}. */
