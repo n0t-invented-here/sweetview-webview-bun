@@ -52,12 +52,13 @@ It answers in one of two ways:
 A handler that throws answers 500, and so does a response returned from the handler that is refused
 (bad headers, a status outside 100-599, a body over 4 GiB - 1): a returned response never strands
 the request. A request the handler leaves to `completeRequest` stays open until it is answered, and
-the page waits for it. What happens to requests still open when the webview is destroyed depends on the platform:
+the page waits for it. Destroying the webview closes and releases every request still open, unanswered,
+on both platforms; none of them is passed on to the network:
 
-| Platform | Open requests at destroy                                                        |
-| -------- | ------------------------------------------------------------------------------- |
-| Windows  | Answered `503 Service Unavailable`, then the WebView2 deferral is completed     |
-| macOS    | The `WKURLSchemeTask`s are released unanswered; WebKit stops them as it closes |
+| Platform | Open requests at destroy                                                                     |
+| -------- | -------------------------------------------------------------------------------------------- |
+| Windows  | The WebView2 controller is closed, then each deferral is released without being completed |
+| macOS    | The `WKURLSchemeTask`s are released unanswered; WebKit stops them as it closes              |
 
 A request whose body cannot be read in full never reaches the handler: Windows answers it 500, macOS
 fails it with the stream's error.
