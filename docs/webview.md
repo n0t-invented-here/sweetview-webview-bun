@@ -40,14 +40,18 @@ new Webview(debug?: boolean, size?: Size, window?: Pointer | null)
 
 ## Content
 
-| Member                       | Meaning                                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `navigate(url)`              | Loads a URL. A `data:` URI works; it is re-encoded if needed                                                                   |
-| `setHTML(html)`              | Loads the string as the page. Windows caps it at 2 MB; for anything bigger, or a page with its own files, use `setAsset`       |
-| `setAsset(path, mime, data)` | Serves bytes at the webview's own origin, then `navigate` to them; see [Assets and background](assets-and-background.md)       |
-| `assetOrigin`                | The origin `setAsset` serves at on this platform                                                                               |
-| `init(source)`               | JavaScript run at the start of every page the webview opens, before `window.onload`                                            |
-| `eval(source)`               | Runs JavaScript in the current page. Asynchronous; the result is discarded. Run it after the page has loaded, or it is dropped |
+| Member                        | Meaning                                                                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `navigate(url)`               | Loads a URL. A `data:` URI works; it is re-encoded if needed                                                                   |
+| `setHTML(html)`               | Loads the string as the page. Windows caps it at 2 MB; for anything bigger, or a page with its own files, use `setAsset`       |
+| `setAsset(path, mime, data)`  | Serves bytes at the webview's own origin, then `navigate` to them; see [Assets and background](assets-and-background.md)       |
+| `assetOrigin`                 | The origin `setAsset` serves at on this platform                                                                               |
+| `setRequestHandler(handler)`  | Answers requests no asset matches, and every request to `framesOrigin`, in code; see [Requests and drops](requests.md)         |
+| `completeRequest(id, res)`    | Answers a request the handler left open; `completeWebviewRequest` does the same from a worker                                  |
+| `framesOrigin`                | A second origin, cross-origin from `assetOrigin`, for `<iframe>`s the page must not reach into                                 |
+| `setAllowExternalDrop(allow)` | Whether content dragged from outside the app can be dropped on the page                                                        |
+| `init(source)`                | JavaScript run at the start of every page the webview opens, before `window.onload`                                            |
+| `eval(source)`                | Runs JavaScript in the current page. Asynchronous; the result is discarded. Run it after the page has loaded, or it is dropped |
 
 ## Calling bun from the page
 

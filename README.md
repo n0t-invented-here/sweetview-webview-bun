@@ -9,6 +9,9 @@ sweetview fork of the library adds:
 
 - `Webview.setAsset`: serve bytes at the webview's own origin, so pages load by `navigate` and
   fetch by relative URL.
+- `Webview.setRequestHandler`: answer the page's requests in code, with no socket, and
+  `framesOrigin`, a second origin for cross-origin `<iframe>`s.
+- `Webview.setAllowExternalDrop`: refuse drops from outside the app.
 - `Webview.setBackgroundColor`: a color, or transparency, behind the page.
 - System-wide mouse and keyboard hooks, with a permission model for macOS.
 
@@ -116,6 +119,7 @@ bun build --compile --minify --sourcemap ./index.ts ./worker.ts --outfile webser
 | ------------------------------------------------------ | ------------------------------------------------------------------------------ |
 | [The `Webview` class](docs/webview.md)                 | Creating a window, loading content, bindings between bun and the page, running |
 | [Assets and background](docs/assets-and-background.md) | `setAsset` (serve files at the webview's own origin), `setBackgroundColor`     |
+| [Requests and drops](docs/requests.md)                 | `setRequestHandler`, `completeRequest`, `framesOrigin`, `setAllowExternalDrop` |
 | [Input hooks](docs/input-hooks.md)                     | System-wide mouse and keyboard hooks, the permission model for macOS           |
 
 [`docs/`](docs/) has the same list. Each member is also documented where it is declared, in `src/`.

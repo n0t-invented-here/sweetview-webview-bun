@@ -4,6 +4,7 @@ import {
   FFIType,
   JSCallback,
   ptr,
+  toArrayBuffer,
   type Pointer,
 } from "bun:ffi";
 import { encodeCString, instances, lib, libraryPath } from "./ffi";
@@ -22,6 +23,127 @@ function openForkLib() {
       returns: FFIType.i32,
     },
   });
+}
+
+// The request handler additions (library 2.8.0), bound on first use like the others.
+let requestLib: ReturnType<typeof openRequestLib> | undefined;
+function openRequestLib() {
+  return dlopen(libraryPath, {
+    webview_set_request_handler: {
+      args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    webview_complete_request: {
+      args: [
+        FFIType.ptr,
+        FFIType.u64,
+        FFIType.i32,
+        FFIType.ptr,
+        FFIType.ptr,
+        FFIType.u64,
+      ],
+      returns: FFIType.i32,
+    },
+    webview_set_allow_external_drop: {
+      args: [FFIType.ptr, FFIType.i32],
+      returns: FFIType.i32,
+    },
+  });
+}
+
+/** A `webview_error_t` other than `WEBVIEW_ERROR_OK` from the library. */
+export class WebviewError extends Error {
+  constructor(
+    readonly fn: string,
+    readonly code: number,
+  ) {
+    super(`${fn} failed with webview_error_t ${code}`);
+    this.name = "WebviewError";
+  }
+}
+
+function check(fn: string, code: number) {
+  if (code !== 0) throw new WebviewError(fn, code);
+}
+
+/** A request to one of the webview's origins that no asset answered (see {@link Webview.setRequestHandler}). */
+export interface WebviewRequest {
+  /** Pass to {@link Webview.completeRequest} when answering it yourself. */
+  id: bigint;
+  /** The HTTP method, for example `GET` or `POST`. */
+  method: string;
+  /** The full URL, for example `http://webview.localhost/api?x=1`. */
+  url: string;
+  /** The request headers in the order the browser sent them; a name may repeat. */
+  headers: [name: string, value: string][];
+  /** The request body (a copy), or null when there is none. */
+  body: Uint8Array | null;
+}
+
+/** The answer to a {@link WebviewRequest}. */
+export interface WebviewResponse {
+  /** HTTP status code, 100 to 599. Defaults to 200. */
+  status?: number;
+  /**
+   * Response headers: an object of name to value, or `[name, value]` pairs,
+   * which allow a name to repeat (`Set-Cookie`). CR and LF are removed from
+   * names and values.
+   */
+  headers?: Record<string, string> | [name: string, value: string][];
+  /** The body; a string is encoded as UTF-8. */
+  body?: Uint8Array | ArrayBuffer | string | null;
+}
+
+/**
+ * Answers a {@link WebviewRequest}: return (or resolve to) a
+ * {@link WebviewResponse} and it is sent, or return nothing and call
+ * {@link Webview.completeRequest} with `request.id` later. A handler that
+ * throws or rejects answers 500.
+ */
+export type RequestHandler = (
+  request: WebviewRequest,
+) => WebviewResponse | void | Promise<WebviewResponse | void>;
+
+function responseBodyBytes(body: WebviewResponse["body"]): Uint8Array | null {
+  if (body == null) return null;
+  if (typeof body === "string") return new TextEncoder().encode(body);
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  return body;
+}
+
+/**
+ * Answers a request handed to a {@link Webview.setRequestHandler request handler},
+ * given the webview's {@link Webview.unsafeHandle}. Safe to call from any
+ * thread: this is how a `Worker` answers requests while {@link Webview.run}
+ * blocks the thread that owns the webview. Post the handle and the request
+ * to the worker, then call this there. The headers and body are copied before
+ * this returns. Completing a request twice, or one the browser has since
+ * cancelled, does nothing.
+ *
+ * @param handle The webview's {@link Webview.unsafeHandle}.
+ * @param id The request's {@link WebviewRequest.id}.
+ */
+export function completeWebviewRequest(
+  handle: Pointer,
+  id: bigint,
+  response: WebviewResponse = {},
+) {
+  const status = response.status ?? 200;
+  const headers = response.headers
+    ? encodeCString(JSON.stringify(response.headers))
+    : null;
+  const body = responseBodyBytes(response.body);
+  check(
+    "webview_complete_request",
+    (requestLib ??= openRequestLib()).symbols.webview_complete_request(
+      handle,
+      id,
+      status,
+      headers,
+      body && body.byteLength > 0 ? ptr(body) : null,
+      BigInt(body?.byteLength ?? 0),
+    ),
+  );
 }
 
 /** Window size */
@@ -50,6 +172,7 @@ export const enum SizeHint {
 export class Webview {
   #handle: Pointer | null = null;
   #callbacks: Map<string, JSCallback> = new Map();
+  #requestCallback: JSCallback | null = null;
 
   /** **UNSAFE**: Highly unsafe API, beware!
    *
@@ -182,10 +305,23 @@ export class Webview {
    * resources.
    */
   destroy() {
+    if (!this.#handle) return;
     for (const callback of this.#callbacks.keys()) this.unbind(callback);
+    // Unregister the request handler before the library can call it again;
+    // its JSCallback is freed only once the webview is gone. Requests still
+    // open are answered 503 by webview_destroy.
+    if (this.#requestCallback) {
+      (requestLib ??= openRequestLib()).symbols.webview_set_request_handler(
+        this.#handle,
+        null,
+        null,
+      );
+    }
     lib.symbols.webview_terminate(this.#handle);
     lib.symbols.webview_destroy(this.#handle);
     this.#handle = null;
+    this.#requestCallback?.close();
+    this.#requestCallback = null;
   }
 
   /**
@@ -242,6 +378,192 @@ export class Webview {
     return process.platform === "win32"
       ? "http://webview.localhost"
       : "webview://localhost";
+  }
+
+  /**
+   * A second origin, cross-origin from {@link Webview.assetOrigin}, for
+   * content the page must not reach into, such as a sandboxed `<iframe>`.
+   * Every request to it goes to the {@link Webview.setRequestHandler request handler}.
+   * `http://frames.webview.localhost` on Windows, `webview-frames://localhost`
+   * on macOS. Nothing reaches the network.
+   */
+  get framesOrigin(): string {
+    return process.platform === "win32"
+      ? "http://frames.webview.localhost"
+      : "webview-frames://localhost";
+  }
+
+  /**
+   * Answers requests in code instead of from fixed bytes: every request to
+   * {@link Webview.assetOrigin} that no {@link Webview.setAsset asset}
+   * matches (assets still answer first), and every request to
+   * {@link Webview.framesOrigin}. Nothing reaches the network and no socket
+   * is opened. Without a handler those requests answer 404.
+   *
+   * The handler runs on the thread that runs the webview, inside
+   * {@link Webview.run}. It must not block. Return a
+   * {@link WebviewResponse} to send it, or return nothing and answer later
+   * with {@link Webview.completeRequest} or, from a `Worker`,
+   * {@link completeWebviewRequest}; a handler that throws answers 500.
+   * Requests stay open until answered, and the browser waits for them.
+   *
+   * A returned promise is answered when it settles (500 if it rejects), but
+   * promises settle only when the thread's event loop turns, and
+   * {@link Webview.run} blocks it: Bun does not run microtasks, timers or I/O
+   * on that thread until `run()` returns. For work that needs `await`, post
+   * the request to a `Worker` and answer it there with
+   * {@link completeWebviewRequest}.
+   *
+   * Pass `null` to remove the handler; requests already handed to it stay
+   * open until completed or until the webview is destroyed (which answers
+   * them 503).
+   *
+   * Windows: WebView2's `WebResourceRequested`, deferred until completed.
+   * macOS: a `WKURLSchemeHandler` for the schemes `webview` and
+   * `webview-frames`. Linux: accepted; not served.
+   *
+   * ## Example
+   *
+   * ```ts
+   * webview.setRequestHandler(async (req) => {
+   *   const { pathname } = new URL(req.url);
+   *   if (pathname === "/api/time") {
+   *     return {
+   *       headers: { "Content-Type": "application/json" },
+   *       body: JSON.stringify({ now: Date.now() }),
+   *     };
+   *   }
+   *   return { status: 404 };
+   * });
+   * webview.navigate(`${webview.assetOrigin}/index.html`);
+   * ```
+   */
+  setRequestHandler(handler: RequestHandler | null) {
+    const symbols = (requestLib ??= openRequestLib()).symbols;
+    const previous = this.#requestCallback;
+    if (!handler) {
+      check(
+        "webview_set_request_handler",
+        symbols.webview_set_request_handler(this.#handle, null, null),
+      );
+      this.#requestCallback = null;
+      previous?.close();
+      return;
+    }
+    const callback = new JSCallback(
+      (
+        id: bigint,
+        methodPtr: Pointer | null,
+        urlPtr: Pointer | null,
+        headersPtr: Pointer | null,
+        bodyPtr: Pointer | null,
+        bodyLen: bigint,
+      ) => {
+        let request: WebviewRequest;
+        try {
+          const length = Number(bodyLen);
+          request = {
+            id: BigInt(id),
+            method: methodPtr ? new CString(methodPtr).toString() : "GET",
+            url: urlPtr ? new CString(urlPtr).toString() : "",
+            headers: headersPtr
+              ? JSON.parse(new CString(headersPtr).toString())
+              : [],
+            // Copied: the pointer is valid only during this call.
+            body:
+              bodyPtr && length > 0
+                ? new Uint8Array(toArrayBuffer(bodyPtr, 0, length)).slice()
+                : null,
+          };
+        } catch {
+          this.#completeQuietly(BigInt(id), { status: 500 });
+          return;
+        }
+        let result: ReturnType<RequestHandler>;
+        try {
+          result = handler(request);
+        } catch {
+          this.#completeQuietly(request.id, { status: 500 });
+          return;
+        }
+        if (result instanceof Promise) {
+          result.then(
+            (response) => {
+              if (response) this.#completeQuietly(request.id, response);
+            },
+            () => this.#completeQuietly(request.id, { status: 500 }),
+          );
+        } else if (result) {
+          this.#completeQuietly(request.id, result);
+        }
+      },
+      {
+        args: [
+          FFIType.u64,
+          FFIType.ptr,
+          FFIType.ptr,
+          FFIType.ptr,
+          FFIType.ptr,
+          FFIType.u64,
+          FFIType.ptr,
+        ],
+        returns: FFIType.void,
+      },
+    );
+    const code = symbols.webview_set_request_handler(
+      this.#handle,
+      callback.ptr,
+      null,
+    );
+    if (code !== 0) {
+      callback.close();
+      throw new WebviewError("webview_set_request_handler", code);
+    }
+    this.#requestCallback = callback;
+    previous?.close();
+  }
+
+  /**
+   * Answers a request handed to the {@link Webview.setRequestHandler request handler}.
+   * Safe to call from any thread, including after the handler returned. The
+   * headers and body are copied before this returns. Completing a request
+   * twice, or one the browser has since cancelled, does nothing.
+   *
+   * @param id The request's {@link WebviewRequest.id}.
+   */
+  completeRequest(id: bigint, response: WebviewResponse = {}) {
+    if (!this.#handle) return;
+    completeWebviewRequest(this.#handle, id, response);
+  }
+
+  // For responses produced from the handler: a bad response becomes a 500
+  // rather than an exception thrown into the library's callback.
+  #completeQuietly(id: bigint, response: WebviewResponse) {
+    try {
+      this.completeRequest(id, response);
+    } catch {
+      try {
+        this.completeRequest(id, { status: 500 });
+      } catch {
+        // The webview is gone; nothing to answer.
+      }
+    }
+  }
+
+  /**
+   * Sets whether files and other content dragged from outside the app can be
+   * dropped on the page. Allowed by default. Windows:
+   * `ICoreWebView2Controller4::AllowExternalDrop`. macOS, Linux: accepted;
+   * does nothing.
+   */
+  setAllowExternalDrop(allow: boolean) {
+    check(
+      "webview_set_allow_external_drop",
+      (requestLib ??= openRequestLib()).symbols.webview_set_allow_external_drop(
+        this.#handle,
+        allow ? 1 : 0,
+      ),
+    );
   }
 
   /**
