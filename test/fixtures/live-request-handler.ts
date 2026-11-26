@@ -8,6 +8,7 @@ import {
   completeWebviewRequest,
   Webview,
   WebviewError,
+  writeWebviewResponseChunk,
   type WebviewRequest,
 } from "../../src/index";
 
@@ -374,6 +375,15 @@ try {
   report.afterDestroyMethod = 0;
 } catch (e) {
   report.afterDestroyMethod = e instanceof WebviewError ? e.code : String(e);
+}
+// An empty chunk against the destroyed handle still reaches the library and
+// is refused with -3, like a chunk with bytes.
+try {
+  writeWebviewResponseChunk(handle, 1n, new Uint8Array(0));
+  report.emptyChunkAfterDestroy = 0;
+} catch (e) {
+  report.emptyChunkAfterDestroy =
+    e instanceof WebviewError ? e.code : String(e);
 }
 report.afterDestroyWorker = await new Promise((resolve) => {
   worker.onmessage = (e) => {

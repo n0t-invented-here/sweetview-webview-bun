@@ -132,7 +132,9 @@ Answer a request handed to the handler. The headers are checked (see
 Answering a request twice, or one the browser cancelled, does nothing. `completeWebviewRequest` is
 the same thing as a free function that takes the webview's `unsafeHandle`, for workers.
 
-Both throw a `WebviewError`: -2 for bad headers, a status outside 100-599 or a body over 4 GiB - 1;
+Both throw a `WebviewError`: -2 for bad headers, a status that is not an integer from 100 to 599
+(checked before the call, so `4294967496` or `200.5` is refused rather than wrapped or truncated
+to 200), or a body over 4 GiB - 1;
 -3 once the webview is destroyed or being destroyed (`completeRequest` throws -3 after `destroy()`
 too, the same as `completeWebviewRequest` on the stale handle).
 
@@ -162,6 +164,24 @@ never on to the network.
 Whether files and other content dragged from outside the app can be dropped on the page. Allowed by
 default. Windows: `ICoreWebView2Controller4::AllowExternalDrop`. macOS, Linux: accepted; does
 nothing.
+
+## `setFileDropHandler(handler)`
+
+Receives the real filesystem paths of files dropped on the webview from the operating system
+(Explorer, Finder) as a `string[]`. While a handler is set, a drop of files is taken from the page
+and the browser does not open the dropped file; `null` hands drops back to the page. The handler
+runs on the webview's thread, inside `run()`, and may call `setFileDropHandler(null)`, open a
+dialog, or `destroy()` the webview.
+
+- Windows: drops are captured only on the trusted top-level document, never inside an `<iframe>`
+  (a cross-origin one from `framesOrigin` included). The top-level document's drop event hands the
+  dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and
+  WebView2's `ICoreWebView2File` gives each path. A drop on an iframe is left to that iframe and
+  never reaches the handler. Needs external drop allowed (`setAllowExternalDrop`) and WebView2
+  Runtime 113 or later.
+- macOS: the `WKWebView` takes drags whose pasteboard holds file URLs, wherever on the view they
+  land.
+- Linux: accepted; does nothing.
 
 ## Errors
 

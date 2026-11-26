@@ -88,6 +88,16 @@ function check(fn: string, code: number) {
   if (code !== 0) throw new WebviewError(fn, code);
 }
 
+// The library takes the status as a C int: a value that is not an integer
+// from 100 to 599 would be truncated or wrapped on the way (4294967496
+// becomes 200, 200.5 becomes 200), so it is refused here with the library's
+// WEBVIEW_ERROR_INVALID_ARGUMENT before any conversion.
+function checkStatus(fn: string, status: number) {
+  if (!Number.isInteger(status) || status < 100 || status > 599) {
+    throw new WebviewError(fn, -2);
+  }
+}
+
 /** A request to one of the webview's origins that no asset answered (see {@link Webview.setRequestHandler}). */
 export interface WebviewRequest {
   /** Pass to {@link Webview.completeRequest} when answering it yourself. */
@@ -163,6 +173,7 @@ export function completeWebviewRequest(
   response: WebviewResponse = {},
 ) {
   const status = response.status ?? 200;
+  checkStatus("webview_complete_request", status);
   // Bound before any buffer is made, and the buffers are passed as typed
   // arrays (never a numeric ptr(...)), so nothing can collect them before
   // the library has copied them.
@@ -220,13 +231,15 @@ export function beginWebviewResponse(
   id: bigint,
   head: WebviewResponseHead = {},
 ) {
+  const status = head.status ?? 200;
+  checkStatus("webview_begin_response", status);
   const symbols = (streamLib ??= openStreamLib()).symbols;
   const headers = head.headers
     ? encodeCString(JSON.stringify(head.headers))
     : null;
   check(
     "webview_begin_response",
-    symbols.webview_begin_response(handle, id, head.status ?? 200, headers),
+    symbols.webview_begin_response(handle, id, status, headers),
   );
 }
 
@@ -234,8 +247,8 @@ export function beginWebviewResponse(
  * Appends a piece of the body to a response started with
  * {@link beginWebviewResponse}. Safe to call from any thread; the bytes are
  * copied before this returns. A chunk for a response that has ended, was
- * never begun, or that the page abandoned is dropped; an empty chunk does
- * nothing.
+ * never begun, or that the page abandoned is dropped; an empty chunk writes
+ * nothing, but is still checked like any other (a destroyed webview throws).
  *
  * @param chunk The bytes; a string is encoded as UTF-8.
  * @throws {WebviewError} A chunk over 4 GiB - 1, or a destroyed webview
@@ -249,14 +262,16 @@ export function writeWebviewResponseChunk(
   const symbols = (streamLib ??= openStreamLib()).symbols;
   // Passed as a typed array (never a numeric ptr(...)), so it stays alive
   // until the library has copied it.
+  // An empty chunk still goes to the library, so a destroyed webview gives
+  // the same WEBVIEW_ERROR_INVALID_STATE whatever the chunk's size.
   const bytes = responseBodyBytes(chunk)!;
-  if (bytes.byteLength === 0) return;
+  const empty = bytes.byteLength === 0;
   check(
     "webview_write_response_chunk",
     symbols.webview_write_response_chunk(
       handle,
       id,
-      bytes,
+      empty ? null : bytes,
       BigInt(bytes.byteLength),
     ),
   );
@@ -705,6 +720,7 @@ export class Webview {
    * {@link completeWebviewRequest} does.
    */
   completeRequest(id: bigint, response: WebviewResponse = {}) {
+    checkStatus("webview_complete_request", response.status ?? 200);
     if (!this.#handle) {
       // Same answer the library gives completeWebviewRequest on a destroyed
       // handle: WEBVIEW_ERROR_INVALID_STATE.
@@ -720,6 +736,7 @@ export class Webview {
    * {@link Webview.unsafeHandle}.
    */
   beginResponse(id: bigint, head: WebviewResponseHead = {}) {
+    checkStatus("webview_begin_response", head.status ?? 200);
     beginWebviewResponse(this.#liveHandle("webview_begin_response"), id, head);
   }
 
@@ -752,7 +769,11 @@ export class Webview {
    * that carry no files, are untouched. Pass `null` to hand drops back to the
    * page. Runs on the webview's thread, inside {@link Webview.run}.
    *
-   * Windows: the drop's `File` objects go to the host with
+   * The handler may call `setFileDropHandler(null)`, open a dialog, or
+   * {@link Webview.destroy} the webview.
+   *
+   * Windows: drops are captured only on the trusted top-level document,
+   * never inside an `<iframe>`. The drop's `File` objects go to the host with
    * `chrome.webview.postMessageWithAdditionalObjects`, whose
    * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later, with
    * external drop allowed; see {@link Webview.setAllowExternalDrop}). macOS:

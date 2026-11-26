@@ -7,6 +7,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { libraryPath } from "../src/ffi";
+import {
+  beginWebviewResponse,
+  completeWebviewRequest,
+  WebviewError,
+  writeWebviewResponseChunk,
+} from "../src/index";
 
 describe("library exports", () => {
   test("webview_set_request_handler, webview_complete_request, webview_set_allow_external_drop", () => {
@@ -103,6 +109,42 @@ describe("library exports", () => {
     ).toBe(-3);
     expect(lib.symbols.webview_end_response(stale, 1n)).toBe(-3);
     lib.close();
+  });
+});
+
+// What fn throws: a WebviewError's function name and code.
+function thrown(fn: () => void): { fn: string; code: number } | string {
+  try {
+    fn();
+    return "did not throw";
+  } catch (e) {
+    return e instanceof WebviewError ? { fn: e.fn, code: e.code } : String(e);
+  }
+}
+
+describe("argument checks in the bindings", () => {
+  // A handle not in the live-instance registry, as after webview_destroy.
+  const stale = 0x1000 as unknown as Pointer;
+
+  test("a status that is not an integer from 100 to 599 is refused with -2 before the FFI call", () => {
+    // 4294967496 wraps to 200 as a C int and 200.5 truncates to 200, so
+    // both would pass the library's own range check.
+    for (const status of [4294967496, 200.5, 99, 600, Number.NaN]) {
+      expect(
+        thrown(() => completeWebviewRequest(stale, 1n, { status })),
+      ).toEqual({ fn: "webview_complete_request", code: -2 });
+      expect(thrown(() => beginWebviewResponse(stale, 1n, { status }))).toEqual(
+        { fn: "webview_begin_response", code: -2 },
+      );
+    }
+  });
+
+  test("an empty chunk against a destroyed handle is refused with -3, like any chunk", () => {
+    for (const chunk of [new Uint8Array(0), new ArrayBuffer(0), "", "x"]) {
+      expect(
+        thrown(() => writeWebviewResponseChunk(stale, 1n, chunk)),
+      ).toEqual({ fn: "webview_write_response_chunk", code: -3 });
+    }
   });
 });
 
@@ -286,6 +328,8 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(r.afterDestroyWorker).toEqual({ wrapper: -3, raw: -3 });
       // Webview.completeRequest after destroy() throws -3 too.
       expect(r.afterDestroyMethod).toBe(-3);
+      // An empty chunk after destroy is refused with -3, not skipped.
+      expect(r.emptyChunkAfterDestroy).toBe(-3);
     }, 90_000);
   },
 );
