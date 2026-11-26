@@ -223,6 +223,10 @@ the page cannot read the frame's document, and the two talk through `postMessage
 | macOS    | `webview://localhost`      | `webview-frames://localhost`      | A `WKURLSchemeHandler` for `webview`, `webview-frames` |
 | Linux    |                            |                                   | Accepted; not served                                   |
 
+Only those exact origins reach the handler. On macOS a request to the `webview` or `webview-frames`
+scheme with any other authority (`webview://other-host/...`, a port, userinfo) is answered 404 before
+the asset table or the handler sees it; on Windows WebView2 routes only the two origins here.
+
 (\*) Where the WebView2 Runtime has `ICoreWebView2_22` (Runtime 122.0.2365.46 or later; the
 interface shipped in SDK 1.0.2365.46, and the library is built with SDK 1.0.2478.35), the filters are
 added with `AddWebResourceRequestedFilterWithRequestSourceKinds` and all source kinds, so requests
@@ -245,8 +249,9 @@ receives drops only while external drops are allowed.
 ## `setFileDropHandler(handler)`
 
 Receives the real filesystem paths of files dropped on the webview from the operating system
-(Explorer, Finder) as a `string[]`. While a handler is set, a drop of files is taken from the page
-and the browser does not open the dropped file; `null` hands drops back to the page.
+(Explorer, Finder) as a `string[]`. When the platform captures a file drop while a handler is set
+(see the table below for where and when it does), the drop is taken from the page and the browser
+does not open the dropped file; `null` hands drops back to the page.
 
 On Windows and macOS alike:
 
@@ -260,7 +265,7 @@ On Windows and macOS alike:
 
 | Platform | How                                                                                                                                                                                                                                                                                                                                                                    |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Windows  | Drops are captured only on the trusted top-level document, never inside an `<iframe>` (a cross-origin one from `framesOrigin` included). The top-level document's drop event hands the dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and WebView2's `ICoreWebView2File` gives each path. A drop on an iframe is left to that iframe. Needs WebView2 Runtime 113 or later |
+| Windows  | Drops are captured only on the top-level document, never inside an `<iframe>` (a cross-origin one from `framesOrigin` included). The top-level document's drop event hands the dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and WebView2's `ICoreWebView2File` gives each path. A drop on an iframe is left to that iframe. Needs WebView2 Runtime 113 or later: on an older Runtime, which lacks `postMessageWithAdditionalObjects`, the drop is neither accepted nor prevented, so it is left to the page instead of being swallowed, and the callback is not called |
 | macOS    | The library's `WKWebView` subclass takes a drag whose pasteboard holds file URLs and whose source allows copying, wherever on the view it lands, and reads the paths when the drop is performed; any other drag goes to WebKit. Clearing the handler, or refusing external drops, mid-drag refuses the drop                                                       |
 | Linux    | Accepted; does nothing                                                                                                                                                                                                                                                                                                                                                 |
 

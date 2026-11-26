@@ -667,7 +667,11 @@ export class Webview {
    *
    * The origin is `http://webview.localhost` on Windows and
    * `webview://localhost` on macOS; {@link Webview.assetOrigin} is the one for
-   * this platform. On Linux the asset is stored and not served.
+   * this platform. On Linux the asset is stored and not served. On macOS the
+   * authority must be exactly `localhost`: `webview://other-host/...`, a port
+   * or userinfo is answered 404 and never matches an asset. Both platforms
+   * match the request URL's raw path (not percent-decoded; a trailing slash
+   * kept), query string and fragment removed, leading slashes ignored.
    *
    * @param path URL path without the leading slash, for example `index.html`
    * or `js/main.js`. A request's query string and fragment are ignored when
@@ -947,11 +951,13 @@ export class Webview {
 
   /**
    * Receives the real filesystem paths of files dropped on the webview from
-   * the operating system (Explorer, Finder). While a handler is set, a drop
-   * of files is taken from the page: the browser does not open the dropped
-   * file, and the handler gets every path. Drags inside the page, and drags
-   * that carry no files, are untouched. Pass `null` to hand drops back to the
-   * page. Runs on the webview's thread, inside {@link Webview.run}.
+   * the operating system (Explorer, Finder). When the platform captures a
+   * file drop while a handler is set (see the platform notes below for where
+   * and when it does), the drop is taken from the page: the browser does not
+   * open the dropped file, and the handler gets every path. Drags inside the
+   * page, and drags that carry no files, are untouched. Pass `null` to hand
+   * drops back to the page. Runs on the webview's thread, inside
+   * {@link Webview.run}.
    *
    * On Windows and macOS alike the handler needs external drops allowed
    * (see {@link Webview.setAllowExternalDrop}) and runs asynchronously, after
@@ -961,10 +967,13 @@ export class Webview {
    * only after that call returns, and a destroy finishes then too. It never
    * gets an empty list.
    *
-   * Windows: drops are captured only on the trusted top-level document,
+   * Windows: drops are captured only on the top-level document,
    * never inside an `<iframe>`. The drop's `File` objects go to the host with
    * `chrome.webview.postMessageWithAdditionalObjects`, whose
-   * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later).
+   * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later; on
+   * an older Runtime the drop is neither accepted nor prevented, so it is
+   * left to the page instead of being swallowed, and the callback is not
+   * called).
    * macOS: the library's `WKWebView` subclass takes a drag whose pasteboard
    * holds file URLs and whose source allows copying, reads the paths when
    * the drop is performed, and leaves every other drag to WebKit. Linux:
@@ -1074,10 +1083,13 @@ export class Webview {
    * Windows: `ICoreWebView2Controller2::DefaultBackgroundColor`. WebView2
    * takes only `a` of 0 or 255; any other alpha is refused
    * (`WEBVIEW_ERROR_UNSPECIFIED`, code -1). For true transparency the host
-   * window also needs DWM composition that honors alpha. macOS: the
-   * `WKWebView`'s `drawsBackground` off when `a` is 0 (on otherwise), this
-   * color behind the window, and the window non-opaque unless `a` is 255.
-   * Linux: accepted; does nothing.
+   * window also needs DWM composition that honors alpha. macOS: any alpha;
+   * the `WKWebView`'s own background is turned off (`drawsBackground`) and
+   * the color is painted by its backing layer behind the page. With `a`
+   * below 255 the window is made non-opaque with a clear background (owned
+   * or adopted); with `a` of 255 only a window the library created is made
+   * opaque again, and an adopted window's opacity is left as the host set
+   * it. Linux: accepted; does nothing.
    *
    * @throws {WebviewError} A channel that is not an integer from 0 to 255
    * (`WEBVIEW_ERROR_INVALID_ARGUMENT`, code -2, checked before the library

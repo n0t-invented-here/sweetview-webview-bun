@@ -52,6 +52,11 @@ is the same line everywhere.
 | macOS    | `webview://localhost`      | A `WKURLSchemeHandler` for the scheme `webview`, registered when the web view is created |
 | Linux    | `webview://localhost`      | Accepted and stored; not served. Use `setHTML` or a `Bun.serve` on Linux                 |
 
+- Matching is the same on Windows and macOS: the request URL's raw path (not percent-decoded; a
+  trailing slash kept), query string and fragment removed, leading slashes ignored.
+- On macOS the authority must be exactly `localhost` (any case): `webview://other-host/index.html`,
+  a port or userinfo is answered 404 and never matches an asset or reaches the request handler.
+
 ## `setBackgroundColor(r, g, b, a)`
 
 The color the browser paints behind the page, each channel an integer from 0 to 255. With `a` of 0
@@ -66,8 +71,16 @@ webview.setBackgroundColor(0, 0, 0, 0); // transparent
 | Platform | Behavior                                                                                                                                    |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | Windows  | Sets `ICoreWebView2Controller2::DefaultBackgroundColor`. WebView2 takes only `a` of 0 or 255; any other alpha throws `WEBVIEW_ERROR_UNSPECIFIED` (-1). For true transparency the host window also needs DWM composition that honors alpha |
-| macOS    | Sets the `WKWebView`'s `drawsBackground` off when `a` is 0 (on otherwise), this color behind the window, and the window non-opaque unless `a` is 255 |
+| macOS    | Any alpha 0-255. Turns the `WKWebView`'s own background off (`drawsBackground`) and paints the color, in sRGB, on its backing layer behind the page. With `a` below 255 the window is made non-opaque with a clear background (owned or adopted), so the translucent layer shows what is behind it. With `a` of 255 only a window the library created is made opaque again; an adopted window's opacity and background stay as the host set them. Applies once `libwebview.dylib` is rebuilt from current source (see the note below) |
 | Linux    | Accepted; does nothing                                                                                                                      |
+
+> **macOS: the checked-in `libwebview.dylib` predates this behavior.** The layer-backed RGBA color
+> described above (any alpha 0-255, re-applied after WebKit's own layer updates, window opacity
+> handling) applies only once `libwebview.dylib` is rebuilt from current `sweetview-webview` source.
+> The `libwebview.dylib` currently checked in to this repository is older and uses the previous
+> behavior: it sets `drawsBackground = (a != 0)` and puts the color on the window, not the
+> `WKWebView`'s layer, so any `a` above 0 leaves WebKit's own (white) background covering the page
+> area, and only `a` of 0 shows through.
 
 The C side of both is documented in the library fork:
 
