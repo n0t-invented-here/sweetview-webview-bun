@@ -104,21 +104,25 @@ const page = `<!doctype html>
 
     // A service worker's own fetch must reach the handler too (WebView2:
     // the filter covers every request source kind), never the network.
-    try {
-      const reply = new Promise((res) => {
-        navigator.serviceWorker.addEventListener("message", (e) => res(e.data));
-      });
-      navigator.serviceWorker.startMessages();
-      const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-      r.swScope = reg.scope;
-      const ready = await navigator.serviceWorker.ready;
-      ready.active.postMessage("go");
-      r.sw = await Promise.race([
-        reply,
-        new Promise((res) => setTimeout(() => res({ timeout: true }), 15000)),
-      ]);
-    } catch (e) {
-      r.sw = { error: String(e) };
+    // Windows only: WebKit's ServiceWorkerContainer allows only http: and
+    // https: origins, and macOS serves the page from the webview: scheme.
+    if (${JSON.stringify(process.platform === "win32")}) {
+      try {
+        const reply = new Promise((res) => {
+          navigator.serviceWorker.addEventListener("message", (e) => res(e.data));
+        });
+        navigator.serviceWorker.startMessages();
+        const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+        r.swScope = reg.scope;
+        const ready = await navigator.serviceWorker.ready;
+        ready.active.postMessage("go");
+        r.sw = await Promise.race([
+          reply,
+          new Promise((res) => setTimeout(() => res({ timeout: true }), 15000)),
+        ]);
+      } catch (e) {
+        r.sw = { error: String(e) };
+      }
     }
     // Left open on purpose: destroying the webview must answer and release it.
     fetch("/never").catch(() => {});
@@ -220,6 +224,13 @@ try {
   report.afterDestroyMain = 0;
 } catch (e) {
   report.afterDestroyMain = e instanceof WebviewError ? e.code : String(e);
+}
+// Webview.completeRequest after destroy() throws the same -3.
+try {
+  webview.completeRequest(1n, { status: 200, body: "late" });
+  report.afterDestroyMethod = 0;
+} catch (e) {
+  report.afterDestroyMethod = e instanceof WebviewError ? e.code : String(e);
 }
 report.afterDestroyWorker = await new Promise((resolve) => {
   worker.onmessage = (e) => {

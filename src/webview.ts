@@ -558,14 +558,26 @@ export class Webview {
   /**
    * Answers a request handed to the {@link Webview.setRequestHandler request handler}.
    * Safe to call from any thread, including after the handler returned. The
-   * headers are checked and the headers and body copied before this returns;
-   * bad headers throw a {@link WebviewError}. Completing a request twice, or
-   * one the browser has since cancelled, does nothing.
+   * headers are checked and the headers and body copied before this returns.
+   * Completing a request twice, or one the browser has since cancelled, does
+   * nothing.
+   *
+   * A response refused here leaves the request open, so it can still be
+   * answered; compare a response returned from the handler, which becomes a
+   * 500 instead (see `docs/requests.md`).
    *
    * @param id The request's {@link WebviewRequest.id}.
+   * @throws {WebviewError} Bad headers (see {@link WebviewResponse.headers}),
+   * a status outside 100-599, a body over 4 GiB - 1, or a webview already
+   * destroyed (`WEBVIEW_ERROR_INVALID_STATE`, code -3), as
+   * {@link completeWebviewRequest} does.
    */
   completeRequest(id: bigint, response: WebviewResponse = {}) {
-    if (!this.#handle) return;
+    if (!this.#handle) {
+      // Same answer the library gives completeWebviewRequest on a destroyed
+      // handle: WEBVIEW_ERROR_INVALID_STATE.
+      throw new WebviewError("webview_complete_request", -3);
+    }
     completeWebviewRequest(this.#handle, id, response);
   }
 

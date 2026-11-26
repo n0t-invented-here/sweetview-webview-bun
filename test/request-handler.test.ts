@@ -144,9 +144,15 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(p.echoEvil).toBeNull();
 
       // A service worker's own fetch reaches the handler, not the network.
-      expect(p.sw).toEqual({ status: 200, text: "sw-ok" });
-      expect(paths).toContain("/sw.js");
-      expect(paths).toContain("/from-sw");
+      // Windows only: WebKit allows service workers only on http: and https:
+      // origins, and macOS serves the page from the webview: scheme.
+      if (process.platform === "win32") {
+        expect(p.sw).toEqual({ status: 200, text: "sw-ok" });
+        expect(paths).toContain("/sw.js");
+        expect(paths).toContain("/from-sw");
+      } else {
+        expect(p.sw).toBeUndefined();
+      }
 
       // Binary image completed from a worker thread.
       expect(p.imgEvent).toBe("load");
@@ -172,6 +178,8 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       // from the main thread and from a worker, wrapper and raw call alike.
       expect(r.afterDestroyMain).toBe(-3);
       expect(r.afterDestroyWorker).toEqual({ wrapper: -3, raw: -3 });
+      // Webview.completeRequest after destroy() throws -3 too.
+      expect(r.afterDestroyMethod).toBe(-3);
     }, 90_000);
   },
 );

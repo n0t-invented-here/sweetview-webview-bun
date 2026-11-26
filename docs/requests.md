@@ -49,8 +49,10 @@ It answers in one of two ways:
   `Uint8Array` or `ArrayBuffer`.
 - Return nothing and call `completeRequest(req.id, response)` later.
 
-A handler that throws answers 500. The request stays open until it is answered, and the page waits
-for it. What happens to requests still open when the webview is destroyed depends on the platform:
+A handler that throws answers 500, and so does a response returned from the handler that is refused
+(bad headers, a status outside 100-599, a body over 4 GiB - 1): a returned response never strands
+the request. A request the handler leaves to `completeRequest` stays open until it is answered, and
+the page waits for it. What happens to requests still open when the webview is destroyed depends on the platform:
 
 | Platform | Open requests at destroy                                                        |
 | -------- | ------------------------------------------------------------------------------- |
@@ -130,7 +132,12 @@ Answering a request twice, or one the browser cancelled, does nothing. `complete
 the same thing as a free function that takes the webview's `unsafeHandle`, for workers.
 
 Both throw a `WebviewError`: -2 for bad headers, a status outside 100-599 or a body over 4 GiB - 1;
--3 once the webview is destroyed or being destroyed.
+-3 once the webview is destroyed or being destroyed (`completeRequest` throws -3 after `destroy()`
+too, the same as `completeWebviewRequest` on the stale handle).
+
+A refused call answers nothing: the request stays open, and the caller still owes it an answer (a
+good response, or `{ status: 500 }`). This differs from returning a response from the handler,
+where a refused response is caught and answered 500 for you.
 
 ## `framesOrigin`
 
@@ -167,4 +174,6 @@ a body and a custom header answered from a worker, a binary image, a cross-origi
 `framesOrigin`, that `setAsset` assets still answer first, a service worker's own `fetch` reaching
 the handler, bad response headers (`{"X-Example":trueish}`, an escaped NUL, a name with a space, a
 lone surrogate, CR LF) refused with -2, and `completeWebviewRequest` after the webview is destroyed
-refused with -3 from the main thread and from a worker.
+refused with -3 from the main thread and from a worker, as is `completeRequest` after `destroy()`.
+The service worker check runs on Windows only: WebKit allows service workers only on `http:` and
+`https:` origins, not on the `webview:` scheme macOS serves from.
