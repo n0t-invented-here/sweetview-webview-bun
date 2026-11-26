@@ -63,6 +63,47 @@ describe("library exports", () => {
     ).toBe(-3);
     lib.close();
   });
+
+  test("webview_begin_response, webview_write_response_chunk, webview_end_response, webview_set_file_drop_handler", () => {
+    const lib = dlopen(libraryPath, {
+      webview_begin_response: {
+        args: [FFIType.ptr, FFIType.u64, FFIType.i32, FFIType.ptr],
+        returns: FFIType.i32,
+      },
+      webview_write_response_chunk: {
+        args: [FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64],
+        returns: FFIType.i32,
+      },
+      webview_end_response: {
+        args: [FFIType.ptr, FFIType.u64],
+        returns: FFIType.i32,
+      },
+      webview_set_file_drop_handler: {
+        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+        returns: FFIType.i32,
+      },
+    });
+    for (const fn of Object.values(lib.symbols)) {
+      expect(typeof fn).toBe("function");
+    }
+    // A null webview is refused: WEBVIEW_ERROR_INVALID_ARGUMENT (-2).
+    expect(lib.symbols.webview_begin_response(null, 1n, 200, null)).toBe(-2);
+    expect(
+      lib.symbols.webview_write_response_chunk(null, 1n, null, 0n),
+    ).toBe(-2);
+    expect(lib.symbols.webview_end_response(null, 1n)).toBe(-2);
+    expect(lib.symbols.webview_set_file_drop_handler(null, null, null)).toBe(
+      -2,
+    );
+    // A handle not in the live-instance registry: WEBVIEW_ERROR_INVALID_STATE (-3).
+    const stale = 0x1000 as unknown as Pointer;
+    expect(lib.symbols.webview_begin_response(stale, 1n, 200, null)).toBe(-3);
+    expect(
+      lib.symbols.webview_write_response_chunk(stale, 1n, null, 0n),
+    ).toBe(-3);
+    expect(lib.symbols.webview_end_response(stale, 1n)).toBe(-3);
+    lib.close();
+  });
 });
 
 describe.if(process.platform === "win32" || process.platform === "darwin")(
@@ -110,6 +151,8 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
 
       expect(p.error).toBeUndefined();
       expect(r.externalDrop).toBe("ok");
+      // webview_set_file_drop_handler registers and clears without error.
+      expect(r.fileDropSetClear).toBe("ok");
 
       // Dynamic HTML from the handler at the main origin.
       expect(p.parentOrigin).toBe(origin);
@@ -186,6 +229,51 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       // Unknown paths reach the handler, which answers 404.
       expect(p.missingStatus).toBe(404);
       expect(paths).toContain("/nothing-here");
+
+      if (process.platform === "win32") {
+        // Server-Sent Events streamed from a worker, no socket: all three
+        // arrive in order, as separate events (event 2 was written in two
+        // halves, 100 ms apart), over one connection, with no reconnect.
+        const sse = p.sse;
+        expect(sse.timeout).toBeUndefined();
+        expect(sse.events.map((e: { n: number }) => e.n)).toEqual([1, 2, 3]);
+        expect(sse.events.map((e: { id: string }) => e.id)).toEqual([
+          "1",
+          "2",
+          "3",
+        ]);
+        expect(paths.filter((q: string) => q === "/sse")).toHaveLength(1);
+        const last = sse.events[2].data;
+        // WebView2 hands the page an intercepted response only once its body
+        // has ended (WebView2Feedback #3519; the ICoreWebView2WebResource-
+        // Response docs require all content by the time the deferral
+        // completes), so every event arrives together, after the last write.
+        // If a future WebView2 Runtime delivers partial bodies, the page acks
+        // event 1 before event 2 is written and these flip: update the docs
+        // of webview_begin_response then.
+        expect(last.ack1BeforeEvent2).toBe(false);
+        expect(last.ack2BeforeEvent3).toBe(false);
+        expect(sse.events[0].receivedAt).toBeGreaterThanOrEqual(last.writtenAt);
+        // Bad header JSON, a bad status and a NULL chunk with a length are
+        // refused (-2) before anything is sent; a second begin for the same
+        // request is WEBVIEW_ERROR_DUPLICATE (1).
+        expect(last.badBegin).toBe(-2);
+        expect(last.badStatus).toBe(-2);
+        expect(last.badChunk).toBe(-2);
+        expect(last.duplicateBegin).toBe(1);
+
+        // OS file drops: the drop script ran enabled, took a drop carrying
+        // files from the page, and let go of drops once the handler was
+        // cleared. A File made in script has no path, so the handler never
+        // ran.
+        expect(p.fileDrop).toEqual({
+          enabledFlag: true,
+          prevented: true,
+          clearedFlag: false,
+          preventedAfterClear: false,
+        });
+        expect(r.fileDropCalls).toEqual([]);
+      }
 
       // A request still open when the webview is destroyed is answered and released.
       expect(r.neverOpened).toBe(true);

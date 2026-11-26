@@ -32,6 +32,15 @@ webview.setAllowExternalDrop(false);
 webview.setAllowExternalDrop(true);
 report.externalDrop = "ok";
 
+// OS file drops: registering, clearing and registering again all succeed
+// (throws otherwise). Left set, so the page starts with the drop script
+// enabled; the page clears it through clearFileDrop below.
+const fileDropCalls: string[][] = [];
+webview.setFileDropHandler((paths) => fileDropCalls.push(paths));
+webview.setFileDropHandler(null);
+webview.setFileDropHandler((paths) => fileDropCalls.push(paths));
+report.fileDropSetClear = "ok";
+
 // The asset table still answers first, untouched by the handler.
 webview.setAsset(
   "static.js",
@@ -102,6 +111,54 @@ const page = `<!doctype html>
     }
 
     r.missingStatus = (await fetch("/nothing-here")).status;
+
+    const isWindows = ${JSON.stringify(process.platform === "win32")};
+    // Server-Sent Events streamed from a worker (webview_begin_response,
+    // webview_write_response_chunk, webview_end_response). Each event is
+    // acknowledged to the host; the worker records whether the ack came
+    // before it wrote the next event. Windows only for now: WebKit's
+    // EventSource over a custom scheme is not covered by this test.
+    if (isWindows) {
+      r.sse = await new Promise((resolve) => {
+        const events = [];
+        const es = new EventSource("/sse");
+        const timer = setTimeout(() => {
+          es.close();
+          resolve({ timeout: true, events });
+        }, 30000);
+        es.onmessage = (e) => {
+          const data = JSON.parse(e.data);
+          events.push({ n: data.n, id: e.lastEventId, receivedAt: Date.now(), data });
+          if (data.n < 3) {
+            window.sseAck(data.n);
+            return;
+          }
+          es.close();
+          clearTimeout(timer);
+          resolve({ events });
+        };
+      });
+    }
+
+    // OS file drops (webview_set_file_drop_handler). The handler was set
+    // before navigating, so the drop script starts enabled: a drop carrying
+    // a File is kept from the page's default. Clearing the handler hands
+    // drops back to the page, in this document too.
+    if (isWindows) {
+      const syntheticDrop = () => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(["x"], "synthetic.txt", { type: "text/plain" }));
+        const ev = new DragEvent("drop", { dataTransfer: dt, cancelable: true, bubbles: true });
+        return !document.body.dispatchEvent(ev); // true when prevented
+      };
+      r.fileDrop = {
+        enabledFlag: window.__webview_file_drop_enabled__,
+        prevented: syntheticDrop(),
+      };
+      await window.clearFileDrop();
+      r.fileDrop.clearedFlag = window.__webview_file_drop_enabled__;
+      r.fileDrop.preventedAfterClear = syntheticDrop();
+    }
 
     // A service worker's own fetch must reach the handler too (WebView2:
     // the filter covers every request source kind), never the network.
@@ -237,9 +294,12 @@ webview.setRequestHandler((req: WebviewRequest) => {
   }
   if (
     !isFrames &&
-    (url.pathname === "/api/echo" || url.pathname === "/dynamic.png")
+    (url.pathname === "/api/echo" ||
+      url.pathname === "/dynamic.png" ||
+      url.pathname === "/sse")
   ) {
-    // Answered later, from a worker thread, through webview_complete_request.
+    // Answered later, from a worker thread, through webview_complete_request
+    // (/sse: streamed through webview_begin_response and friends).
     worker.postMessage({ handle: Number(handle), request: req });
     return;
   }
@@ -270,6 +330,7 @@ function finishWhenDone() {
   if (report.page && report.neverOpened) {
     report.requests = seen;
     report.iframeEscaped = iframeEscaped;
+    report.fileDropCalls = fileDropCalls;
     lib.symbols.webview_terminate(handle);
   }
 }
@@ -278,6 +339,17 @@ function finishWhenDone() {
 let iframeEscaped = false;
 webview.bind("iframeProbe", () => {
   iframeEscaped = true;
+});
+
+// Relays the page's Server-Sent Event acks to the streaming worker.
+webview.bind("sseAck", (n: number) => {
+  worker.postMessage({ sseAck: n });
+});
+
+// Clears the file drop handler from inside run(), as an app would.
+webview.bind("clearFileDrop", () => {
+  webview.setFileDropHandler(null);
+  return true;
 });
 
 webview.bind("report", (json: string) => {

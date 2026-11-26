@@ -50,6 +50,29 @@ function openRequestLib() {
   });
 }
 
+// Streamed responses and OS file drops, bound on first use like the others.
+let streamLib: ReturnType<typeof openStreamLib> | undefined;
+function openStreamLib() {
+  return dlopen(libraryPath, {
+    webview_begin_response: {
+      args: [FFIType.ptr, FFIType.u64, FFIType.i32, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    webview_write_response_chunk: {
+      args: [FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64],
+      returns: FFIType.i32,
+    },
+    webview_end_response: {
+      args: [FFIType.ptr, FFIType.u64],
+      returns: FFIType.i32,
+    },
+    webview_set_file_drop_handler: {
+      args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+  });
+}
+
 /** A `webview_error_t` other than `WEBVIEW_ERROR_OK` from the library. */
 export class WebviewError extends Error {
   constructor(
@@ -162,6 +185,104 @@ export function completeWebviewRequest(
   );
 }
 
+/** The head of a streamed answer (see {@link beginWebviewResponse}). */
+export interface WebviewResponseHead {
+  /** HTTP status code, 100 to 599. Defaults to 200. */
+  status?: number;
+  /** Response headers, exactly as {@link WebviewResponse.headers}. */
+  headers?: WebviewResponse["headers"];
+}
+
+/**
+ * Starts a streamed answer to a {@link WebviewRequest}, given the webview's
+ * {@link Webview.unsafeHandle}: the status and headers go now, the body
+ * follows piece by piece with {@link writeWebviewResponseChunk}, and
+ * {@link endWebviewResponse} ends it, with no socket. Use instead of
+ * {@link completeWebviewRequest}, never both for one request.
+ *
+ * Safe to call from any thread, like {@link completeWebviewRequest}: a
+ * `Worker` streams while {@link Webview.run} blocks the webview's thread.
+ *
+ * Windows: the body is an `IStream` WebView2 reads on its own thread, but
+ * WebView2 hands the page the response only once the whole body is read (a
+ * WebView2 limitation for intercepted requests), so an `EventSource` there
+ * gets every event at {@link endWebviewResponse}, not one by one. macOS:
+ * `didReceiveResponse:` / `didReceiveData:` / `didFinish` on the
+ * `WKURLSchemeTask`, which the page reads as it arrives. Linux: accepted;
+ * does nothing.
+ *
+ * @throws {WebviewError} Bad headers, a status outside 100-599, a response
+ * already begun for this request (`WEBVIEW_ERROR_DUPLICATE`, Windows), or a
+ * destroyed webview (`WEBVIEW_ERROR_INVALID_STATE`, code -3).
+ */
+export function beginWebviewResponse(
+  handle: Pointer,
+  id: bigint,
+  head: WebviewResponseHead = {},
+) {
+  const symbols = (streamLib ??= openStreamLib()).symbols;
+  const headers = head.headers
+    ? encodeCString(JSON.stringify(head.headers))
+    : null;
+  check(
+    "webview_begin_response",
+    symbols.webview_begin_response(handle, id, head.status ?? 200, headers),
+  );
+}
+
+/**
+ * Appends a piece of the body to a response started with
+ * {@link beginWebviewResponse}. Safe to call from any thread; the bytes are
+ * copied before this returns. A chunk for a response that has ended, was
+ * never begun, or that the page abandoned is dropped; an empty chunk does
+ * nothing.
+ *
+ * @param chunk The bytes; a string is encoded as UTF-8.
+ * @throws {WebviewError} A chunk over 4 GiB - 1, or a destroyed webview
+ * (`WEBVIEW_ERROR_INVALID_STATE`, code -3).
+ */
+export function writeWebviewResponseChunk(
+  handle: Pointer,
+  id: bigint,
+  chunk: Uint8Array | ArrayBuffer | string,
+) {
+  const symbols = (streamLib ??= openStreamLib()).symbols;
+  // Passed as a typed array (never a numeric ptr(...)), so it stays alive
+  // until the library has copied it.
+  const bytes = responseBodyBytes(chunk)!;
+  if (bytes.byteLength === 0) return;
+  check(
+    "webview_write_response_chunk",
+    symbols.webview_write_response_chunk(
+      handle,
+      id,
+      bytes,
+      BigInt(bytes.byteLength),
+    ),
+  );
+}
+
+/**
+ * Ends a response started with {@link beginWebviewResponse}; the page sees
+ * the end once it has read every chunk written before. Safe to call from any
+ * thread. Ending twice, or a response never begun, does nothing.
+ *
+ * @throws {WebviewError} A destroyed webview (`WEBVIEW_ERROR_INVALID_STATE`,
+ * code -3).
+ */
+export function endWebviewResponse(handle: Pointer, id: bigint) {
+  check(
+    "webview_end_response",
+    (streamLib ??= openStreamLib()).symbols.webview_end_response(handle, id),
+  );
+}
+
+/**
+ * Receives the real filesystem paths of files dropped on the webview from
+ * the operating system (see {@link Webview.setFileDropHandler}).
+ */
+export type FileDropHandler = (paths: string[]) => void;
+
 /** Window size */
 export interface Size {
   /** The width of the window */
@@ -189,6 +310,7 @@ export class Webview {
   #handle: Pointer | null = null;
   #callbacks: Map<string, JSCallback> = new Map();
   #requestCallback: JSCallback | null = null;
+  #fileDropCallback: JSCallback | null = null;
 
   /** **UNSAFE**: Highly unsafe API, beware!
    *
@@ -333,11 +455,21 @@ export class Webview {
         null,
       );
     }
+    // Likewise the file drop handler.
+    if (this.#fileDropCallback) {
+      (streamLib ??= openStreamLib()).symbols.webview_set_file_drop_handler(
+        this.#handle,
+        null,
+        null,
+      );
+    }
     lib.symbols.webview_terminate(this.#handle);
     lib.symbols.webview_destroy(this.#handle);
     this.#handle = null;
     this.#requestCallback?.close();
     this.#requestCallback = null;
+    this.#fileDropCallback?.close();
+    this.#fileDropCallback = null;
   }
 
   /**
@@ -579,6 +711,93 @@ export class Webview {
       throw new WebviewError("webview_complete_request", -3);
     }
     completeWebviewRequest(this.#handle, id, response);
+  }
+
+  /**
+   * Starts a streamed answer to a request handed to the
+   * {@link Webview.setRequestHandler request handler}; see
+   * {@link beginWebviewResponse}, which a `Worker` calls with
+   * {@link Webview.unsafeHandle}.
+   */
+  beginResponse(id: bigint, head: WebviewResponseHead = {}) {
+    beginWebviewResponse(this.#liveHandle("webview_begin_response"), id, head);
+  }
+
+  /** Appends a body chunk; see {@link writeWebviewResponseChunk}. */
+  writeResponseChunk(id: bigint, chunk: Uint8Array | ArrayBuffer | string) {
+    writeWebviewResponseChunk(
+      this.#liveHandle("webview_write_response_chunk"),
+      id,
+      chunk,
+    );
+  }
+
+  /** Ends a streamed answer; see {@link endWebviewResponse}. */
+  endResponse(id: bigint) {
+    endWebviewResponse(this.#liveHandle("webview_end_response"), id);
+  }
+
+  // The handle, or the library's answer for a destroyed one:
+  // WEBVIEW_ERROR_INVALID_STATE.
+  #liveHandle(fn: string): Pointer {
+    if (!this.#handle) throw new WebviewError(fn, -3);
+    return this.#handle;
+  }
+
+  /**
+   * Receives the real filesystem paths of files dropped on the webview from
+   * the operating system (Explorer, Finder). While a handler is set, a drop
+   * of files is taken from the page: the browser does not open the dropped
+   * file, and the handler gets every path. Drags inside the page, and drags
+   * that carry no files, are untouched. Pass `null` to hand drops back to the
+   * page. Runs on the webview's thread, inside {@link Webview.run}.
+   *
+   * Windows: the drop's `File` objects go to the host with
+   * `chrome.webview.postMessageWithAdditionalObjects`, whose
+   * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later, with
+   * external drop allowed; see {@link Webview.setAllowExternalDrop}). macOS:
+   * the `WKWebView` takes drags whose pasteboard holds file URLs. Linux:
+   * accepted; does nothing.
+   */
+  setFileDropHandler(handler: FileDropHandler | null) {
+    const symbols = (streamLib ??= openStreamLib()).symbols;
+    const previous = this.#fileDropCallback;
+    if (!handler) {
+      check(
+        "webview_set_file_drop_handler",
+        symbols.webview_set_file_drop_handler(this.#handle, null, null),
+      );
+      this.#fileDropCallback = null;
+      previous?.close();
+      return;
+    }
+    const callback = new JSCallback(
+      (pathsPtr: Pointer | null) => {
+        let paths: string[];
+        try {
+          paths = pathsPtr ? JSON.parse(new CString(pathsPtr).toString()) : [];
+        } catch {
+          return;
+        }
+        try {
+          handler(paths);
+        } catch {
+          // Nothing may unwind into the library.
+        }
+      },
+      { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.void },
+    );
+    const code = symbols.webview_set_file_drop_handler(
+      this.#handle,
+      callback.ptr,
+      null,
+    );
+    if (code !== 0) {
+      callback.close();
+      throw new WebviewError("webview_set_file_drop_handler", code);
+    }
+    this.#fileDropCallback = callback;
+    previous?.close();
   }
 
   // For responses produced from the handler: a bad response becomes a 500
