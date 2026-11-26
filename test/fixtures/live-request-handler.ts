@@ -59,12 +59,18 @@ report.fileDropSetClear = "ok";
     webview.setFileDropHandler(null);
     reentrant.pendingInsideCall = pendingCallbackCloses();
   });
-  const call = new CFunction({
+  // CFunction is a factory, not a constructor; the wrapper is closed once
+  // the call has returned.
+  const call = CFunction({
     ptr: fileDropCallbackPtr(webview)!,
     args: [FFIType.ptr, FFIType.ptr],
     returns: FFIType.void,
   });
-  call(encodeCString(JSON.stringify(["/reentrant"])), null);
+  try {
+    call(encodeCString(JSON.stringify(["/reentrant"])), null);
+  } finally {
+    call.close();
+  }
   reentrant.pendingAfterReturn = pendingCallbackCloses();
   // The next change, outside any call, closes it.
   webview.setFileDropHandler((paths) => fileDropCalls.push(paths));

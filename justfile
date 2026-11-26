@@ -22,6 +22,7 @@ submodule:
 [extension(".ps1")]
 build: submodule
     $ErrorActionPreference = "Stop"
+    $started = Get-Date
     $commit = (git -C webview rev-parse --short HEAD).Trim()
     Write-Host "building webview $commit for $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
     if ($IsWindows) {
@@ -39,12 +40,16 @@ build: submodule
             if (!$code) { cmake --build build --config Release; $code = $LASTEXITCODE }
         } finally { Pop-Location }
         if ($code) { exit $code }
+        if (!(Test-Path "{{built}}")) { throw "build did not produce {{built}}" }
         Copy-Item "{{built}}" "{{shipped}}" -Force
+        # The shipped file must be the one just built, not one left by an earlier run.
+        if ((Get-FileHash "{{built}}").Hash -ne (Get-FileHash "{{shipped}}").Hash) { throw "{{shipped}} is not the library just built" }
     } else {
-        # scripts/build.ts: cmake + ninja with the fork's toolchain file for the OS, copies into build/ and strips
+        # scripts/build.ts: cmake + ninja with the fork's toolchain file for the OS, copies into build/ and strips; fails on any failed step
         bun scripts/build.ts; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        # strip rewrote it, so a file older than this run is one left by an earlier run.
+        if (!(Test-Path "{{shipped}}") -or (Get-Item "{{shipped}}").LastWriteTime -lt $started) { throw "build did not produce a fresh {{shipped}}" }
     }
-    if (!(Test-Path "{{shipped}}")) { throw "build did not produce {{shipped}}" }
     Write-Host "built {{shipped}} from webview $commit ($((Get-Item '{{shipped}}').Length) bytes)"
 
 # Remove webview's build folder; build/ (the shipped libraries) stays

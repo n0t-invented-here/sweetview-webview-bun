@@ -39,6 +39,11 @@ mouse.dispose();
 
 Return `true` to swallow the event: no window gets it.
 
+Only the events above are delivered. Side buttons (X1/X2, and on macOS every button past the
+middle one) are not reported and pass on untouched. Horizontal scrolling has no event of its own:
+on Windows it is not delivered, and on macOS a scroll arrives as `Wheel` with only its vertical
+amount (`0` for a purely horizontal one).
+
 ## Keyboard hook
 
 `installKeyboardHook(handler)` returns `{ dispose() }`. The handler gets a `KeyMessage`:
@@ -79,11 +84,11 @@ when, if ever, the user is asked:
 ```typescript
 import { Feature, Permission, permissions } from "@n1h/sweetview-webview-bun";
 
-permissions.autoRequest = false; // no system dialog from a failed install
+permissions.autoRequest = false; // a failed install does not ask the system
 
 if (!permissions.ready(Feature.KeyboardHook)) {
   explainWhyTheAppNeedsIt();
-  permissions.request(Permission.DeviceControl); // the system's dialog
+  permissions.request(Permission.DeviceControl); // asks macOS; whether a dialog shows is up to macOS
 }
 ```
 
@@ -91,7 +96,7 @@ if (!permissions.ready(Feature.KeyboardHook)) {
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `permissions.needed(feature)`     | The `Permission`s a feature needs here: `[Permission.DeviceControl]` on macOS, `[]` on Windows and Linux                                                                         |
 | `permissions.status(permission)`  | `"granted"`, `"missing"`, or `"not-applicable"` (no such permission on this platform). Shows nothing                                                                             |
-| `permissions.request(permission)` | Asks the system: on macOS the dialog, each time while missing. Same answers as `status`                                                                                          |
+| `permissions.request(permission)` | Asks the system. macOS adds the app to the row in System Settings and decides whether to show a prompt (it may not, for example after the user dismissed one); the user grants the permission in System Settings either way. Same answers as `status` |
 | `permissions.ready(feature)`      | `true` when every permission the feature needs is granted                                                                                                                        |
 | `permissions.autoRequest`         | Default `true`: an install that fails for a missing permission asks the system by itself, once per process. `false`: the install only throws, and the app asks through `request` |
 

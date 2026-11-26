@@ -87,9 +87,9 @@ export const permissions = {
   },
 
   /**
-   * Asks the system for a permission: on macOS it adds the app to the row in System Settings > Privacy & Security and
-   * shows its dialog each time this is called while the permission is missing. The user grants it there; the next
-   * install after that succeeds.
+   * Asks the system for a permission: on macOS it adds the app to the row in System Settings > Privacy & Security, and
+   * macOS decides whether to show a prompt (it may show none, for example after the user dismissed one). The user
+   * grants it there; the next install after that succeeds.
    */
   request(permission: Permission): PermissionStatus {
     return statusFrom(

@@ -149,11 +149,18 @@ if (scenario === "request-replace-clear") {
   const callDrop = (paths: string[]) => {
     const ptr = fileDropCallbackPtr(webview);
     if (!ptr) return false;
-    new CFunction({
+    // CFunction is a factory, not a constructor; the wrapper is closed
+    // once the call has returned.
+    const call = CFunction({
       ptr,
       args: [FFIType.ptr, FFIType.ptr],
       returns: FFIType.void,
-    })(encodeCString(JSON.stringify(paths)), null);
+    });
+    try {
+      call(encodeCString(JSON.stringify(paths)), null);
+    } finally {
+      call.close();
+    }
     return true;
   };
   webview.setFileDropHandler((paths) => {

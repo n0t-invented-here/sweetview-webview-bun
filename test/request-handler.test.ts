@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serializeBindingError } from "../src/binding-error";
 import { libraryPath } from "../src/ffi";
 import {
   beginWebviewResponse,
@@ -446,6 +447,56 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(r.runReturned).toBe(true);
       expect(r.afterRun).toEqual(destroyedCodes);
       expect(r.pendingAtEnd).toBe(0);
+    }, 90_000);
+  },
+);
+
+describe("binding error serialization", () => {
+  test("an Error becomes its message, undefined becomes empty, the rest JSON or String()", () => {
+    expect(serializeBindingError(new Error("boom"))).toBe('"boom"');
+    expect(serializeBindingError(new TypeError("typed"))).toBe('"typed"');
+    expect(serializeBindingError(undefined)).toBe("");
+    expect(serializeBindingError("plain")).toBe('"plain"');
+    expect(serializeBindingError({ reason: "x" })).toBe('{"reason":"x"}');
+    expect(serializeBindingError(null)).toBe("null");
+    // JSON.stringify throws on a BigInt and on a cycle, and drops a symbol.
+    expect(serializeBindingError(10n)).toBe('"10"');
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    expect(serializeBindingError(cycle)).toBe('"[object Object]"');
+    expect(serializeBindingError(Symbol("s"))).toBe('"Symbol(s)"');
+  });
+});
+
+describe.if(process.platform === "win32" || process.platform === "darwin")(
+  "live webview: bindings",
+  () => {
+    test("bind: a thrown Error rejects with its message, undefined resolves, a duplicate bindRaw is refused with 1 and the original stays", () => {
+      const { r, exitCode } = runFixture("live-bind.ts", ["results-and-errors"]);
+      expect(exitCode).toBe(0);
+      expect(r.page).toEqual({
+        boom: { type: "string", value: "boom" },
+        throwsObject: { reason: "plain" },
+        nothing: "undefined",
+        original: "original",
+      });
+      expect(r.duplicate).toBe(1);
+      expect(r.duplicateCalled).toBe(false);
+      expect(r.unbindUnknown).toBe(2);
+      expect(r.runReturned).toBe(true);
+      // Destroyed webviews leave `instances`.
+      expect(r.instancesAfterRun).toBe(0);
+    }, 90_000);
+
+    test("destroy() of a webview that never ran does not end the next webview's run()", () => {
+      const { r, exitCode } = runFixture("live-bind.ts", [
+        "destroy-unrun-then-run",
+      ]);
+      expect(exitCode).toBe(0);
+      expect(r.instancesAfterFirst).toBe(0);
+      expect(r.secondPageRan).toBe(true);
+      expect(r.runReturned).toBe(true);
+      expect(r.instancesAfterRun).toBe(0);
     }, 90_000);
   },
 );

@@ -63,25 +63,27 @@ export function hookInstallError(
  * install keeps one small trampoline until the process ends.
  */
 export class HookCallback {
-  private inCall = false;
+  // A depth, not a flag: a handler that pumps native events can be entered
+  // again before its outer call returns, and the outer call is still inside.
+  private depth = 0;
   constructor(readonly callback: JSCallback) {}
 
   guard(run: () => boolean): number {
-    this.inCall = true;
+    this.depth++;
     try {
       return run() ? 1 : 0;
     } finally {
-      this.inCall = false;
+      this.depth--;
     }
   }
 
   release(): void {
-    if (this.inCall) orphans.push(this);
+    if (this.depth > 0) orphans.push(this);
     else this.callback.close();
   }
 
   get isInCall(): boolean {
-    return this.inCall;
+    return this.depth > 0;
   }
 }
 

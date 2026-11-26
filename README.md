@@ -48,9 +48,7 @@ which throw.
 
 <details>
   <summary>Click here for instructions on 🪟 Windows</summary>
-  The compiled windows library in this package does not bundle any webview version with itself but rather uses the system installed one.
-
-> To bundle a specific version, see Development section below.
+  The compiled Windows library in this package does not bundle the WebView2 Runtime: it always uses the one installed on the system. (The `WEBVIEW_MSWEBVIEW2_VERSION` build option in the Development section picks the WebView2 SDK headers the library is compiled against, not a Runtime to ship.)
 
 The <a href="https://developer.microsoft.com/en-us/microsoft-edge/webview2/">Microsoft Edge WebView2</a> runtime is required to be installed on the system for any version of Windows before Windows 11.
 To manually update or install the latest version, follow the steps <a href="https://github.com/MicrosoftEdge/WebView2Feedback/issues/3371#issuecomment-1500917825">here</a>.
@@ -101,7 +99,7 @@ bun build --compile --minify --sourcemap ./examples/todoapp/app.ts --outfile tod
 >
 > #### 🍎 To hide it in macOS:
 >
-> Add the extension `.app` in the end of the above bun build command.
+> Naming the output `something.app` does not make an app bundle: it is still a single executable file, and Finder still opens it in Terminal. Put the executable in a real bundle instead (`MyApp.app/Contents/MacOS/MyApp` plus a `MyApp.app/Contents/Info.plist` whose `CFBundleExecutable` is `MyApp`).
 
 ### Cross-platform compilation
 
@@ -115,7 +113,7 @@ See [full list](https://github.com/oven-sh/bun/blob/main/docs/bundler/executable
 
 ### Bun.serve with webview
 
-If you run a web server it will block the main thread, but using workers you can run the webview window on another thread. Clone this repository then,
+`webview.run()` blocks the thread it is called on until the window closes, so a `Bun.serve` on that thread would never answer. Keep the webview on the main thread (its UI thread) and run the server in a `Worker`, as [examples/webserver](examples/webserver) does: `index.ts` starts `worker.ts` (the `Bun.serve`) and then opens the window. Clone this repository then,
 
 ```bash
 cd examples/webserver/
@@ -203,7 +201,7 @@ The compiled library file can be found inside the `build` folder.
 ### Customization
 
 - 🐧 For linux, if you want to use a different WebkitGTK version, change the cmake `WEBVIEW_WEBKITGTK_API` option in _build.ts_ to one of the [available values](https://github.com/webview/webview?tab=readme-ov-file#linux-specific-options). Be sure to first install the corresponding version libraries.
-- 🪟 For windows, if you want to bundle a specific webview version instead of using the system installed one, set the cmake `WEBVIEW_MSWEBVIEW2_VERSION` option to one of the [NuGet version strings](https://www.nuget.org/packages/Microsoft.Web.WebView2/#versions-body-tab).
+- 🪟 For Windows, the cmake `WEBVIEW_MSWEBVIEW2_VERSION` option selects which WebView2 SDK (the `Microsoft.Web.WebView2` NuGet package's headers, by its [version string](https://www.nuget.org/packages/Microsoft.Web.WebView2/#versions-body-tab)) the library is compiled against. It does not bundle a WebView2 Runtime: the library always runs on the Runtime installed on the system.
 
 Check out the [webview build docs](https://github.com/webview/webview?tab=readme-ov-file#customization) for more options.
 

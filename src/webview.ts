@@ -6,6 +6,7 @@ import {
   toArrayBuffer,
   type Pointer,
 } from "bun:ffi";
+import { serializeBindingError } from "./binding-error";
 import { encodeCString, instances, lib, libraryPath } from "./ffi";
 import {
   registerFileDropCallbackPtr,
@@ -429,6 +430,8 @@ export class Webview {
   // Set by destroy() until webview_destroy has run on it; see destroy().
   #pendingDestroy: Pointer | null = null;
   #finishDestroyScheduled = false;
+  // True while this webview's run() is inside webview_run; see destroy().
+  #running = false;
   #callbacks: Map<string, NativeCallback> = new Map();
   #requestCallback: NativeCallback | null = null;
   #fileDropCallback: NativeCallback | null = null;
@@ -555,6 +558,9 @@ export class Webview {
             Number(debugOrHandle),
             window,
           ) as Pointer | null);
+    // A null handle is never registered: every later call would act on
+    // nothing, and the window would silently never appear.
+    if (!this.#handle) throw new WebviewError("webview_create", -1);
     if (size !== undefined) this.size = size;
     instances.push(this);
     registerFileDropCallbackPtr(this, () => this.#fileDropCallback?.ptr ?? null);
@@ -579,8 +585,11 @@ export class Webview {
       const handle = this.#handle;
       this.#handle = null;
       this.#pendingDestroy = handle;
-      // Ends run(), which then finishes the teardown (see run()).
-      lib.symbols.webview_terminate(handle);
+      // Ends run(), which then finishes the teardown (see run()). Only while
+      // this webview's own run() is in progress: otherwise the quit would
+      // reach whichever loop runs next on this thread (another webview's, or
+      // this one's after it returned) and end it at once.
+      if (this.#running) lib.symbols.webview_terminate(handle);
     }
     if (!this.#pendingDestroy) return;
     if (nativeCallDepth > 0) {
@@ -625,6 +634,9 @@ export class Webview {
     this.#requestCallback = null;
     this.#fileDropCallback?.release();
     this.#fileDropCallback = null;
+    // Gone from the library, so gone from `instances` (see unload()).
+    const index = instances.indexOf(this);
+    if (index >= 0) instances.splice(index, 1);
   }
 
   #scheduleFinishDestroy() {
@@ -1118,8 +1130,13 @@ export class Webview {
    * the webview is automatically destroyed.
    */
   run() {
-    lib.symbols.webview_run(this.#handle);
-    this.destroy();
+    this.#running = true;
+    try {
+      lib.symbols.webview_run(this.#handle);
+    } finally {
+      this.#running = false;
+      this.destroy();
+    }
   }
 
   /**
@@ -1159,13 +1176,27 @@ export class Webview {
           },
         ),
     );
+    // The library is asked first, and the new callback is recorded only once
+    // it accepted it: a refused bind (a name already bound gives
+    // WEBVIEW_ERROR_DUPLICATE, code 1) closes the new callback and leaves any
+    // existing binding of that name untouched.
+    let code: number;
+    try {
+      code = lib.symbols.webview_bind(
+        this.#handle,
+        encodeCString(name),
+        callbackResource.ptr,
+        arg,
+      ) as number;
+    } catch (err) {
+      callbackResource.release();
+      throw err;
+    }
+    if (code !== 0) {
+      callbackResource.release();
+      throw new WebviewError("webview_bind", code);
+    }
     this.#callbacks.set(name, callbackResource);
-    lib.symbols.webview_bind(
-      this.#handle,
-      encodeCString(name),
-      callbackResource.ptr,
-      arg,
-    );
   }
 
   /**
@@ -1178,12 +1209,14 @@ export class Webview {
    * Bindings are reachable from the top-level document only; calls posted
    * from an `<iframe>` are dropped (the library checks the frame).
    *
-   * Errors and promises: a callback that throws rejects the page's promise
-   * with the thrown value serialized as JSON (an `Error` serializes to `{}`,
-   * so send a string or plain object to keep the message). A returned promise
-   * resolves the page's call when it fulfills, but a rejected promise is not
-   * reported back, so the page's call never settles; catch inside the
-   * callback. Promises settle only when the thread's event loop turns, which
+   * Results, errors and promises: the return value reaches the page as JSON;
+   * `undefined` (or nothing) resolves the page's call with `undefined`. A
+   * callback that throws, or whose arguments are not valid JSON, rejects the
+   * page's call: an `Error` arrives as its `message` string, other values as
+   * their JSON (or their `String()` form when they have none). A returned
+   * promise (or thenable) settles the page's call the same way when it
+   * fulfills or rejects. A result JSON cannot represent (a cycle, a BigInt)
+   * rejects the call. Promises settle only when the thread's event loop turns, which
    * {@link Webview.run} blocks, so an `await` inside a binding does not
    * complete until `run()` returns; keep bindings synchronous, or hand the
    * work to a `Worker`.
@@ -1230,22 +1263,46 @@ export class Webview {
    */
   bind(name: string, callback: (...args: any) => any) {
     this.bindRaw(name, (seq, req) => {
-      const args = JSON.parse(req);
-      let result;
-      let success: boolean;
+      // Every path ends in exactly one webview_return, so the page's call
+      // always settles and no rejection is left unhandled in Bun.
+      let settled = false;
+      const reply = (status: number, json: string) => {
+        if (settled) return;
+        settled = true;
+        // Destroyed while a promise was pending: nothing to answer.
+        if (!this.#handle) return;
+        this.return(seq, status, json);
+      };
+      const reject = (err: unknown) => reply(1, serializeBindingError(err));
+      const fulfill = (value: unknown) => {
+        let json: string | undefined;
+        try {
+          json = value === undefined ? "" : JSON.stringify(value);
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        // "" is the library's undefined; JSON.stringify gives undefined for
+        // a function or a symbol.
+        reply(0, json ?? "");
+      };
       try {
-        result = callback(...args);
-        success = true;
+        const args = JSON.parse(req);
+        const result = callback(...args);
+        if (
+          result !== null &&
+          (typeof result === "object" || typeof result === "function") &&
+          typeof (result as PromiseLike<unknown>).then === "function"
+        ) {
+          Promise.resolve(result as PromiseLike<unknown>).then(
+            fulfill,
+            reject,
+          );
+        } else {
+          fulfill(result);
+        }
       } catch (err) {
-        result = err;
-        success = false;
-      }
-      if (result instanceof Promise) {
-        result.then((r) =>
-          this.return(seq, success ? 0 : 1, JSON.stringify(r)),
-        );
-      } else {
-        this.return(seq, success ? 0 : 1, JSON.stringify(result));
+        reject(err);
       }
     });
   }
@@ -1257,8 +1314,13 @@ export class Webview {
    * @param name The name of the bound function
    */
   unbind(name: string) {
-    //@ts-ignore
-    lib.symbols.webview_unbind(this.#handle, encodeCString(name));
+    // Checked first: on failure (WEBVIEW_ERROR_NOT_FOUND, code 2, for a name
+    // not bound) the library may still call the binding, so its callback
+    // stays open.
+    check(
+      "webview_unbind",
+      lib.symbols.webview_unbind(this.#handle, encodeCString(name)) as number,
+    );
     // Deferred when the binding unbinds itself from inside its own call.
     this.#callbacks.get(name)?.release();
     this.#callbacks.delete(name);

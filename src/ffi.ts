@@ -27,7 +27,8 @@ export const instances: Webview[] = [];
  * package may be called after `unload()`.
  */
 export function unload() {
-  for (const instance of instances) instance.destroy();
+  // A copy: each destroy removes its instance from `instances`.
+  for (const instance of [...instances]) instance.destroy();
   lib.close();
 }
 
@@ -92,11 +93,11 @@ export const lib = dlopen(lib_file.default, {
   },
   webview_bind: {
     args: [FFIType.ptr, FFIType.ptr, FFIType.function, FFIType.ptr],
-    returns: FFIType.void,
+    returns: FFIType.i32,
   },
   webview_unbind: {
     args: [FFIType.ptr, FFIType.ptr],
-    returns: FFIType.void,
+    returns: FFIType.i32,
   },
   webview_return: {
     args: [FFIType.ptr, FFIType.ptr, FFIType.i32, FFIType.ptr],

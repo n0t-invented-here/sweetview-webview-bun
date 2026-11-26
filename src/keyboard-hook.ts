@@ -101,8 +101,14 @@ export function installKeyboardHook(handler: KeyHandler): KeyboardHook {
   return {
     dispose() {
       if (disposed) return;
+      // On failure the hook is still installed and still calls the
+      // callback, so it is not retired; dispose() may be tried again.
+      // NOT_FOUND (2) means the hook is already gone.
+      const code = lib.symbols.webview_keyboard_hook_remove();
+      if (code !== 0 && code !== 2) {
+        throw new Error(`webview_keyboard_hook_remove failed: error ${code}`);
+      }
       disposed = true;
-      lib.symbols.webview_keyboard_hook_remove();
       cb.release();
     },
   };
