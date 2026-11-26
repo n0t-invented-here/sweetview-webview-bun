@@ -48,9 +48,13 @@ new Webview(debug?: boolean, size?: Size, window?: Pointer | null)
 | `assetOrigin`                 | The origin `setAsset` serves at on this platform                                                                               |
 | `setRequestHandler(handler)`  | Answers requests no asset matches, and every request to `framesOrigin`, in code; see [Requests and drops](requests.md)         |
 | `completeRequest(id, res)`    | Answers a request the handler left open; `completeWebviewRequest` does the same from a worker                                  |
+| `beginResponse(id, head?)`    | Starts a streamed answer: status and headers now; `beginWebviewResponse` does the same from a worker. See [Streaming](requests.md#streaming) |
+| `writeResponseChunk(id, chunk)` | Appends body bytes to a streamed answer; `writeWebviewResponseChunk` from a worker                                           |
+| `endResponse(id)`             | Ends a streamed answer; `endWebviewResponse` from a worker                                                                     |
 | `framesOrigin`                | A second origin, cross-origin from `assetOrigin`, for `<iframe>`s the page must not reach into                                 |
-| `setAllowExternalDrop(allow)` | Whether content dragged from outside the app can be dropped on the page                                                        |
-| `init(source)`                | JavaScript run at the start of every page the webview opens, before `window.onload`                                            |
+| `setAllowExternalDrop(allow)` | Whether content dragged from outside the app can be dropped on the page (Windows and macOS); in-page drags keep working       |
+| `setFileDropHandler(handler)` | Receives the real paths of files dropped from the OS (Windows and macOS); see [Requests and drops](requests.md)                |
+| `init(source)`                | JavaScript run at the start of every page the webview opens, before `window.onload`. macOS: the top-level document only. Windows: WebView2 runs it in every frame, `<iframe>`s included, so guard top-level-only code with `if (window === window.top)` |
 | `eval(source)`                | Runs JavaScript in the current page. Asynchronous; the result is discarded. Run it after the page has loaded, or it is dropped |
 
 ## Calling bun from the page
@@ -67,7 +71,7 @@ webview.setHTML(
 
 | Member                          | Meaning                                                                                                                                                                                            |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bind(name, callback)`          | Makes `window[name]` in the page an async function that calls `callback` in bun. Arguments arrive as JSON-converted values; the return value (or a thrown error) goes back as the promise's result |
+| `bind(name, callback)`          | Makes `window[name]` in the page an async function that calls `callback` in bun. Arguments arrive as JSON-converted values; the return value resolves the page's promise, and a thrown value rejects it, serialized as JSON (an `Error` becomes `{}`, so throw a string or plain object to keep the message). A returned promise resolves the page's call when it fulfills; a rejected one is not reported, so the page's call never settles. Top-level document only: calls from `<iframe>`s are dropped |
 | `unbind(name)`                  | Removes the binding and frees its callback                                                                                                                                                         |
 | `bindRaw(name, callback, arg?)` | The low-level form: `callback(seq, req, arg)` gets the request id and the raw JSON array of arguments, and answers with `return`                                                                   |
 | `return(seq, status, result)`   | Answers a `bindRaw` request: `status` 0 with a JSON `result` resolves the page's promise; any other status rejects it with `result` as the error                                                   |
@@ -77,8 +81,10 @@ webview.setHTML(
 | Member      | Meaning                                                                                                     |
 | ----------- | ----------------------------------------------------------------------------------------------------------- |
 | `run()`     | Runs the window's event loop on this thread until the window closes, then calls `destroy()`                 |
-| `destroy()` | Closes the window, unbinds everything, frees the instance. After `run()` returns it has already happened    |
-| `unload()`  | A function, not a method: destroys every instance and unloads the library. For after all windows are closed |
+| `destroy()` | Closes the window, frees the instance and its bindings. After `run()` returns it has already happened. Called from inside a handler or binding, it takes effect at once and the native teardown runs once that call returns |
+| `unload()`  | A function, not a method: destroys every `Webview` this process created and closes the core library handle. The lazily bound feature groups, hooks and permissions are not closed, and installed hooks are not removed. For after all windows are closed; call nothing in the package afterwards |
 
-`run()` blocks the thread, so a bun server or other work runs on a worker;
+`run()` blocks the thread: Bun runs no microtasks, timers or I/O there until it returns, so a
+promise returned from a binding or a request handler settles only after the window closes. A bun
+server or other async work runs on a worker;
 [`examples/webserver/`](../examples/webserver) shows that.

@@ -1,8 +1,13 @@
 # Requests and drops
 
 Additions of the sweetview fork of the library (2.8.0), as methods on [`Webview`](webview.md):
-answer the page's requests in code, give an `<iframe>` its own origin, and control drops from
-outside the app. Nothing reaches the network and no socket is opened.
+answer the page's requests in code (whole, or streamed in chunks), give an `<iframe>` its own
+origin, control drops from outside the app, and receive the paths of files dropped from the OS.
+Nothing reaches the network and no socket is opened.
+
+Implemented on Windows (WebView2) and macOS (WKWebView). On Linux the calls exist, for the C ABI the
+library shares with upstream webview/webview, and are accepted without effect. The checked-in macOS
+and Linux binaries predate these additions; see [Shipped binaries](#shipped-binaries).
 
 ## `setRequestHandler(handler)`
 
@@ -42,12 +47,21 @@ The handler gets a `WebviewRequest`:
 | `headers` | `[name, value]` pairs in the order the browser sent them; a name may repeat |
 | `body`    | A `Uint8Array` copy of the request body, or `null`                          |
 
-It answers in one of two ways:
+It answers in one of three ways:
 
 - Return a `WebviewResponse`: `{ status?, headers?, body? }`. `status` defaults to 200. `headers` is
   an object or `[name, value]` pairs (pairs let a name repeat). `body` is a string (UTF-8),
   `Uint8Array` or `ArrayBuffer`.
 - Return nothing and call `completeRequest(req.id, response)` later.
+- Return nothing and stream the answer: `beginResponse`, `writeResponseChunk`, `endResponse` (see
+  [Streaming](#streaming)).
+
+The handler may replace or clear itself (`setRequestHandler(...)`, `setRequestHandler(null)`) or
+`destroy()` the webview from inside its own call; the native callback it runs in is closed only
+after that call has returned. A `destroy()` there takes effect at once (no handler runs again, and
+`completeRequest`, `setRequestHandler` and `setFileDropHandler` throw `WebviewError` code -3), and
+the native teardown runs once the call has returned, when `run()` returns or on the next turn of
+the event loop, never inside WebView2's `WebResourceRequested`.
 
 A handler that throws answers 500, and so does a response returned from the handler that is refused
 (bad headers, a status outside 100-599, a body over 4 GiB - 1): a returned response never strands
@@ -55,10 +69,12 @@ the request. A request the handler leaves to `completeRequest` stays open until 
 the page waits for it. Destroying the webview closes and releases every request still open, unanswered,
 on both platforms; none of them is passed on to the network:
 
-| Platform | Open requests at destroy                                                                     |
-| -------- | -------------------------------------------------------------------------------------------- |
-| Windows  | The WebView2 controller is closed, then each deferral is released without being completed |
-| macOS    | The `WKURLSchemeTask`s are released unanswered; WebKit stops them as it closes              |
+| Platform | Open requests at destroy                                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Windows  | Every open stream is aborted, the WebView2 controller is closed, then each pending deferral and its event args are released without being completed |
+| macOS    | The retained `WKURLSchemeTask`s, streamed or not, are released unanswered; WebKit stops them as it closes                                  |
+
+On both, answers and stream steps still queued for the UI thread do nothing when they run.
 
 A request whose body cannot be read in full never reaches the handler: Windows answers it 500, macOS
 fails it with the stream's error.
@@ -142,6 +158,59 @@ A refused call answers nothing: the request stays open, and the caller still owe
 good response, or `{ status: 500 }`). This differs from returning a response from the handler,
 where a refused response is caught and answered 500 for you.
 
+## Streaming
+
+```typescript
+webview.setRequestHandler((req) => {
+  if (new URL(req.url).pathname !== "/events") return { status: 404 };
+  worker.postMessage({ handle: webview.unsafeHandle, id: req.id });
+});
+
+// worker.ts
+import {
+  beginWebviewResponse,
+  endWebviewResponse,
+  writeWebviewResponseChunk,
+} from "@n1h/sweetview-webview-bun";
+self.onmessage = async ({ data: { handle, id } }) => {
+  beginWebviewResponse(handle, id, {
+    headers: { "Content-Type": "text/event-stream" },
+  });
+  for (let i = 1; i <= 3; i++) {
+    writeWebviewResponseChunk(handle, id, `data: event ${i}\n\n`);
+    await Bun.sleep(100);
+  }
+  endWebviewResponse(handle, id);
+};
+```
+
+| Method on `Webview`             | Free function for workers                         | Does                                                       |
+| ------------------------------- | ------------------------------------------------- | ---------------------------------------------------------- |
+| `beginResponse(id, head?)`      | `beginWebviewResponse(handle, id, head?)`         | Sends the status (default 200) and headers                 |
+| `writeResponseChunk(id, chunk)` | `writeWebviewResponseChunk(handle, id, chunk)`    | Appends body bytes; a string is UTF-8; the bytes are copied |
+| `endResponse(id)`               | `endWebviewResponse(handle, id)`                  | Ends the body                                              |
+
+Use streaming instead of `completeRequest`, never both for one request. All six are safe on any
+thread, like `completeWebviewRequest`.
+
+- `head` takes `status` and `headers`, checked exactly as for `completeRequest` (see
+  [Response headers](#response-headers)): a bad one throws -2 before anything is sent.
+- A chunk over 4 GiB - 1 throws -2. An empty chunk writes nothing but is still checked, so after the
+  webview is destroyed it throws -3 like any other.
+- Beginning a request already answered or cancelled does nothing, and its chunks are dropped.
+  Beginning one whose stream is already open throws `WEBVIEW_ERROR_DUPLICATE` (code 1) on Windows;
+  macOS ignores the second begin.
+- Ending twice, or a response never begun, does nothing; a request never begun can still be
+  answered with `completeRequest`.
+- Once the webview is destroyed, all of them throw -3 (`WEBVIEW_ERROR_INVALID_STATE`). The methods
+  on `Webview` throw -3 after `destroy()` too.
+
+| Platform | How the page receives it                                                                                                                                                                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | The body is an `IStream` WebView2 reads on its own thread, so the UI thread never waits. WebView2 hands the response to the page only once the whole body is read (WebView2Feedback #3519), so an `EventSource` gets every event at `endResponse`, not one by one |
+| macOS    | `didReceiveResponse:`, `didReceiveData:` per chunk and `didFinish` on the `WKURLSchemeTask`, in order on the main queue: Server-Sent Events and large media reach the page as they are written                                                                   |
+| Linux    | Accepted; does nothing                                                                                                                                                                                                                                       |
+
 ## `framesOrigin`
 
 A second origin, cross-origin from `assetOrigin`, for content the page must not reach into, such as
@@ -154,34 +223,46 @@ the page cannot read the frame's document, and the two talk through `postMessage
 | macOS    | `webview://localhost`      | `webview-frames://localhost`      | A `WKURLSchemeHandler` for `webview`, `webview-frames` |
 | Linux    |                            |                                   | Accepted; not served                                   |
 
-(\*) Requests from service workers and shared workers are caught too, with
-`AddWebResourceRequestedFilterWithRequestSourceKinds`, on WebView2 Runtime 125 or later; an older
-Runtime reports only document requests. A response WebView2 refuses to build goes out as a bare 500,
-never on to the network.
+(\*) Where the WebView2 Runtime has `ICoreWebView2_22` (Runtime 122.0.2365.46 or later; the
+interface shipped in SDK 1.0.2365.46, and the library is built with SDK 1.0.2478.35), the filters are
+added with `AddWebResourceRequestedFilterWithRequestSourceKinds` and all source kinds, so requests
+from service workers, shared workers and cross-origin iframes are caught too. An older Runtime falls
+back to the legacy filter, which misses those. A response WebView2 refuses to build goes out as a
+bare 500, never on to the network.
 
 ## `setAllowExternalDrop(allow)`
 
 Whether files and other content dragged from outside the app can be dropped on the page. Allowed by
-default. Windows: `ICoreWebView2Controller4::AllowExternalDrop`. macOS, Linux: accepted; does
-nothing.
+default. Drags that start inside the page keep working either way. The file drop handler below
+receives drops only while external drops are allowed.
+
+| Platform | How                                                                                                                                                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | `ICoreWebView2Controller4::AllowExternalDrop`, for the whole WebView2 control. A Runtime without it throws `WEBVIEW_ERROR_UNSPECIFIED` (-1)                                                                                           |
+| macOS    | The library's `WKWebView` subclass refuses drags from other apps (`NSDraggingInfo.draggingSource` is nil, as for Finder) and still hands in-app drags to WebKit. Each drag is routed once when it enters; refusing mid-drag ends it |
+| Linux    | Accepted; does nothing                                                                                                                                                                                                                |
 
 ## `setFileDropHandler(handler)`
 
 Receives the real filesystem paths of files dropped on the webview from the operating system
 (Explorer, Finder) as a `string[]`. While a handler is set, a drop of files is taken from the page
-and the browser does not open the dropped file; `null` hands drops back to the page. The handler
-runs on the webview's thread, inside `run()`, and may call `setFileDropHandler(null)`, open a
-dialog, or `destroy()` the webview.
+and the browser does not open the dropped file; `null` hands drops back to the page.
 
-- Windows: drops are captured only on the trusted top-level document, never inside an `<iframe>`
-  (a cross-origin one from `framesOrigin` included). The top-level document's drop event hands the
-  dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and
-  WebView2's `ICoreWebView2File` gives each path. A drop on an iframe is left to that iframe and
-  never reaches the handler. Needs external drop allowed (`setAllowExternalDrop`) and WebView2
-  Runtime 113 or later.
-- macOS: the `WKWebView` takes drags whose pasteboard holds file URLs, wherever on the view they
-  land.
-- Linux: accepted; does nothing.
+On Windows and macOS alike:
+
+- External drops must be allowed (`setAllowExternalDrop`).
+- The handler runs asynchronously on the webview's thread, inside `run()`, after the operating
+  system's drop event has returned. So it may call `setFileDropHandler(null)` or set another handler,
+  open a dialog, or `destroy()` the webview; the native callback it runs in is closed only after the
+  call returns, and a `destroy()` finishes its native teardown then too.
+- It never gets an empty list.
+- A change the library refuses throws a `WebviewError` and leaves the previous handler in place.
+
+| Platform | How                                                                                                                                                                                                                                                                                                                                                                    |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | Drops are captured only on the trusted top-level document, never inside an `<iframe>` (a cross-origin one from `framesOrigin` included). The top-level document's drop event hands the dropped `File` objects to the host with `chrome.webview.postMessageWithAdditionalObjects`, and WebView2's `ICoreWebView2File` gives each path. A drop on an iframe is left to that iframe. Needs WebView2 Runtime 113 or later |
+| macOS    | The library's `WKWebView` subclass takes a drag whose pasteboard holds file URLs and whose source allows copying, wherever on the view it lands, and reads the paths when the drop is performed; any other drag goes to WebKit. Clearing the handler, or refusing external drops, mid-drag refuses the drop                                                       |
+| Linux    | Accepted; does nothing                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Errors
 
@@ -190,11 +271,43 @@ the library refuses a call.
 
 ## Tests
 
-`bun test` opens a real webview and checks all of the above end to end: dynamic HTML, a `POST` with
-a body and a custom header answered from a worker, a binary image, a cross-origin `<iframe>` from
-`framesOrigin`, that `setAsset` assets still answer first, a service worker's own `fetch` reaching
-the handler, bad response headers (`{"X-Example":trueish}`, an escaped NUL, a name with a space, a
-lone surrogate, CR LF) refused with -2, and `completeWebviewRequest` after the webview is destroyed
-refused with -3 from the main thread and from a worker, as is `completeRequest` after `destroy()`.
-The service worker check runs on Windows only: WebKit allows service workers only on `http:` and
-`https:` origins, not on the `webview:` scheme macOS serves from.
+`bun test` opens a real webview in a child process and checks, end to end: dynamic HTML, a `POST`
+with a body and a custom header answered from a worker, a binary image, a cross-origin `<iframe>`
+from `framesOrigin`, that `setAsset` assets still answer first, a service worker's own `fetch`
+reaching the handler, bad response headers (`{"X-Example":trueish}`, an escaped NUL, a name with a
+space, a lone surrogate, CR LF) refused with -2, `completeWebviewRequest` after the webview is
+destroyed refused with -3 from the main thread and from a worker (as is `completeRequest` after
+`destroy()`), a Server-Sent Events stream written from a worker with its chunk timing, refused
+stream arguments and a duplicate begin, and `setAllowExternalDrop` both ways.
+
+What the file drop tests cover, and what they do not:
+
+- Covered: registering, clearing and re-registering the handler; a handler that clears itself
+  from inside its own call (its native callback called the way the library calls it); and, on
+  Windows, a synthetic drop: the page dispatches a `drop` event carrying a `File` it built, and the
+  test checks that the drop script took it while a handler was set and let it go once cleared. A
+  scripted `File` has no filesystem path, so the handler itself is not called there.
+- Not covered: a real drag from Explorer or Finder, and the macOS drag routing. Those are checked by
+  hand.
+
+Without a window, `bun test` also checks the exports and argument checks of every call, including
+`setBackgroundColor` refusing channels that are not integers from 0 to 255. The service worker check
+runs on Windows only: WebKit allows service workers only on `http:` and `https:` origins, not on the
+`webview:` scheme macOS serves from. The live test on macOS needs a dylib rebuilt from current
+source (see [Shipped binaries](#shipped-binaries)).
+
+## Shipped binaries
+
+The library is built from the `webview/` submodule (sweetview-webview) and checked in under
+`build/`. Not every checked-in binary is current with this package's source (2.8.0):
+
+| File                        | Built from                                   | Has the 2.8.0 additions (request handler, streaming, external drop, file drops) |
+| --------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------- |
+| `build/libwebview.dll`      | Current source, on Windows                   | Yes                                                                             |
+| `build/libwebview.dylib`    | An older fork commit (webview `3ad63f3`)     | No: rebuild it on macOS with `just build` before relying on them                |
+| `build/libwebview-x64.so`   | An older fork commit                         | No (and Linux implements none of them; see below)                               |
+
+Assets, background color, the input hooks and permissions are in all three. Each 2.8.0 feature is
+bound lazily and on its own, so a binary without one still serves everything else; calling a missing
+one throws from `dlopen` when it is first used.
+

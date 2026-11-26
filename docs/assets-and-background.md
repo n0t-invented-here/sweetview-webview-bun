@@ -54,8 +54,10 @@ is the same line everywhere.
 
 ## `setBackgroundColor(r, g, b, a)`
 
-The color the browser paints behind the page, each channel 0 to 255. With `a` of 0 and a page whose
-own background is transparent, the native window shows through.
+The color the browser paints behind the page, each channel an integer from 0 to 255. With `a` of 0
+and a page whose own background is transparent, the native window shows through. A channel that is
+not an integer from 0 to 255 throws a `WebviewError` with code -2 before the library is called, and
+an error from the library (below) throws too.
 
 ```typescript
 webview.setBackgroundColor(0, 0, 0, 0); // transparent
@@ -63,8 +65,8 @@ webview.setBackgroundColor(0, 0, 0, 0); // transparent
 
 | Platform | Behavior                                                                                                                                    |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Windows  | Sets `ICoreWebView2Controller2::DefaultBackgroundColor`. For true transparency the host window also needs DWM composition that honors alpha |
-| macOS    | Turns `drawsBackground` off on the `WKWebView` and makes the window non-opaque with this color as its background                            |
+| Windows  | Sets `ICoreWebView2Controller2::DefaultBackgroundColor`. WebView2 takes only `a` of 0 or 255; any other alpha throws `WEBVIEW_ERROR_UNSPECIFIED` (-1). For true transparency the host window also needs DWM composition that honors alpha |
+| macOS    | Sets the `WKWebView`'s `drawsBackground` off when `a` is 0 (on otherwise), this color behind the window, and the window non-opaque unless `a` is 255 |
 | Linux    | Accepted; does nothing                                                                                                                      |
 
 The C side of both is documented in the library fork:

@@ -7,6 +7,10 @@ import {
   type Pointer,
 } from "bun:ffi";
 import { encodeCString, instances, lib, libraryPath } from "./ffi";
+import {
+  registerFileDropCallbackPtr,
+  registerPendingCallbackCloses,
+} from "./internal-test-hooks";
 
 // The sweetview fork's additions, bound on first use so that a library without them (an older
 // build) still loads for everything else.
@@ -24,7 +28,12 @@ function openForkLib() {
   });
 }
 
-// The request handler additions (library 2.8.0), bound on first use like the others.
+// Each feature below is its own group, bound on first use and probing only
+// its own exports, so a library built without one feature (an older or
+// partial build) still serves the others: no file drop handler does not
+// break streaming, and no external drop control does not break requests.
+
+// The request handler (library 2.8.0).
 let requestLib: ReturnType<typeof openRequestLib> | undefined;
 function openRequestLib() {
   return dlopen(libraryPath, {
@@ -43,6 +52,13 @@ function openRequestLib() {
       ],
       returns: FFIType.i32,
     },
+  });
+}
+
+// External drop control.
+let externalDropLib: ReturnType<typeof openExternalDropLib> | undefined;
+function openExternalDropLib() {
+  return dlopen(libraryPath, {
     webview_set_allow_external_drop: {
       args: [FFIType.ptr, FFIType.i32],
       returns: FFIType.i32,
@@ -50,7 +66,7 @@ function openRequestLib() {
   });
 }
 
-// Streamed responses and OS file drops, bound on first use like the others.
+// Streamed responses.
 let streamLib: ReturnType<typeof openStreamLib> | undefined;
 function openStreamLib() {
   return dlopen(libraryPath, {
@@ -66,12 +82,99 @@ function openStreamLib() {
       args: [FFIType.ptr, FFIType.u64],
       returns: FFIType.i32,
     },
+  });
+}
+
+// OS file drops.
+let fileDropLib: ReturnType<typeof openFileDropLib> | undefined;
+function openFileDropLib() {
+  return dlopen(libraryPath, {
     webview_set_file_drop_handler: {
       args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
       returns: FFIType.i32,
     },
   });
 }
+
+// A JSCallback the library calls into for the request handler, the file
+// drop handler or a binding. Closing a JSCallback frees the trampoline native
+// code is executing, so it must not happen while the library is inside it,
+// and a handler may well replace or clear itself, or destroy the webview,
+// from inside its own call. `enter` marks the call; `release` closes at once
+// outside a call, and inside one leaves the callback to
+// `closeReleasedCallbacks`, which runs on the next handler change or destroy
+// made outside any call, and on the next turn of the event loop (after
+// `run()` returns). Same rule as the input hooks' HookCallback
+// (src/input-hooks.ts).
+//
+// `nativeCallDepth` counts the calls in progress across every webview, so
+// Webview.destroy can tell it is running inside one (see there).
+let nativeCallDepth = 0;
+
+class NativeCallback {
+  #depth = 0;
+  readonly callback: JSCallback;
+  constructor(make: (native: NativeCallback) => JSCallback) {
+    this.callback = make(this);
+  }
+
+  get ptr() {
+    return this.callback.ptr;
+  }
+
+  get inCall() {
+    return this.#depth > 0;
+  }
+
+  enter<T>(run: () => T): T {
+    this.#depth++;
+    nativeCallDepth++;
+    try {
+      return run();
+    } finally {
+      nativeCallDepth--;
+      this.#depth--;
+    }
+  }
+
+  release() {
+    if (this.inCall) {
+      released.push(this);
+      scheduleReleasedClose();
+    } else {
+      this.callback.close();
+    }
+  }
+}
+
+const released: NativeCallback[] = [];
+let releasedCloseScheduled = false;
+
+/** Closes the released callbacks native code has left. */
+function closeReleasedCallbacks() {
+  for (let i = released.length - 1; i >= 0; i--) {
+    const callback = released[i]!;
+    if (!callback.inCall) {
+      callback.callback.close();
+      released.splice(i, 1);
+    }
+  }
+}
+
+function scheduleReleasedClose() {
+  if (releasedCloseScheduled) return;
+  releasedCloseScheduled = true;
+  // A timer always runs in a fresh task, outside every native call.
+  const timer = setTimeout(() => {
+    releasedCloseScheduled = false;
+    closeReleasedCallbacks();
+    if (released.length > 0) scheduleReleasedClose();
+  }, 0);
+  (timer as { unref?: () => void }).unref?.();
+}
+
+// For tests only, through src/internal-test-hooks.ts (not exported).
+registerPendingCallbackCloses(() => released.length);
 
 /** A `webview_error_t` other than `WEBVIEW_ERROR_OK` from the library. */
 export class WebviewError extends Error {
@@ -323,9 +426,12 @@ export const enum SizeHint {
 /** An instance of a webview window.*/
 export class Webview {
   #handle: Pointer | null = null;
-  #callbacks: Map<string, JSCallback> = new Map();
-  #requestCallback: JSCallback | null = null;
-  #fileDropCallback: JSCallback | null = null;
+  // Set by destroy() until webview_destroy has run on it; see destroy().
+  #pendingDestroy: Pointer | null = null;
+  #finishDestroyScheduled = false;
+  #callbacks: Map<string, NativeCallback> = new Map();
+  #requestCallback: NativeCallback | null = null;
+  #fileDropCallback: NativeCallback | null = null;
 
   /** **UNSAFE**: Highly unsafe API, beware!
    *
@@ -451,40 +557,89 @@ export class Webview {
           ) as Pointer | null);
     if (size !== undefined) this.size = size;
     instances.push(this);
+    registerFileDropCallbackPtr(this, () => this.#fileDropCallback?.ptr ?? null);
   }
 
   /**
    * Destroys the webview and closes the window along with freeing all internal
    * resources.
+   *
+   * Safe to call from inside the request handler, the file drop handler or a
+   * binding. The webview counts as destroyed at once: no handler or binding
+   * is called again, and the methods that check (such as
+   * {@link Webview.completeRequest} and {@link Webview.setRequestHandler})
+   * throw `WEBVIEW_ERROR_INVALID_STATE` (code -3). The native teardown waits
+   * until the callback has returned, because running it inside the
+   * browser's own event (WebView2's `WebResourceRequested`) can hang: it
+   * happens when {@link Webview.run} returns, or on the next turn of the
+   * event loop.
    */
   destroy() {
-    if (!this.#handle) return;
-    for (const callback of this.#callbacks.keys()) this.unbind(callback);
-    // Unregister the request handler before the library can call it again;
-    // its JSCallback is freed only once the webview is gone. Requests still
-    // open are answered by webview_destroy (Windows: 503; macOS: released).
+    if (this.#handle) {
+      const handle = this.#handle;
+      this.#handle = null;
+      this.#pendingDestroy = handle;
+      // Ends run(), which then finishes the teardown (see run()).
+      lib.symbols.webview_terminate(handle);
+    }
+    if (!this.#pendingDestroy) return;
+    if (nativeCallDepth > 0) {
+      this.#scheduleFinishDestroy();
+      return;
+    }
+    this.#finishDestroy();
+  }
+
+  // The native half of destroy(), outside every native callback.
+  #finishDestroy() {
+    const handle = this.#pendingDestroy;
+    if (!handle) return;
+    this.#pendingDestroy = null;
+    closeReleasedCallbacks();
+    // Unregister the handlers before the library can call them again; their
+    // JSCallbacks are freed only once the webview is gone. Requests still
+    // open are released unanswered by webview_destroy (Windows: open streams
+    // aborted, the controller closed, pending deferrals released without
+    // Complete(); macOS: retained tasks released, and WebKit stops them).
     if (this.#requestCallback) {
       (requestLib ??= openRequestLib()).symbols.webview_set_request_handler(
-        this.#handle,
+        handle,
         null,
         null,
       );
     }
-    // Likewise the file drop handler.
     if (this.#fileDropCallback) {
-      (streamLib ??= openStreamLib()).symbols.webview_set_file_drop_handler(
-        this.#handle,
+      (fileDropLib ??= openFileDropLib()).symbols.webview_set_file_drop_handler(
+        handle,
         null,
         null,
       );
     }
-    lib.symbols.webview_terminate(this.#handle);
-    lib.symbols.webview_destroy(this.#handle);
-    this.#handle = null;
-    this.#requestCallback?.close();
+    lib.symbols.webview_destroy(handle);
+    // webview_destroy took the bindings down with the webview, so they are
+    // not unbound one by one (webview_unbind waits on WebView2's
+    // AddScriptToExecuteOnDocumentCreated); only their callbacks are closed.
+    for (const callback of this.#callbacks.values()) callback.release();
+    this.#callbacks.clear();
+    this.#requestCallback?.release();
     this.#requestCallback = null;
-    this.#fileDropCallback?.close();
+    this.#fileDropCallback?.release();
     this.#fileDropCallback = null;
+  }
+
+  #scheduleFinishDestroy() {
+    if (this.#finishDestroyScheduled) return;
+    this.#finishDestroyScheduled = true;
+    // A timer always runs in a fresh task, outside every native call.
+    setTimeout(() => {
+      this.#finishDestroyScheduled = false;
+      if (!this.#pendingDestroy) return; // run() already finished it
+      if (nativeCallDepth > 0) {
+        this.#scheduleFinishDestroy();
+        return;
+      }
+      this.#finishDestroy();
+    }, 0);
   }
 
   /**
@@ -587,13 +742,24 @@ export class Webview {
    *
    * Pass `null` to remove the handler; requests already handed to it stay
    * open until completed or until the webview is destroyed. Destroying it
-   * answers them `503` on Windows; on macOS the tasks are released unanswered
-   * and WebKit stops them.
+   * releases them unanswered: Windows aborts open streams, closes the
+   * WebView2 controller and releases pending deferrals without completing
+   * them; macOS releases the retained tasks and WebKit stops them. Answers
+   * still queued do nothing.
    *
-   * Windows: WebView2's `WebResourceRequested`, deferred until completed;
-   * requests from service workers are caught too (WebView2 Runtime 125 or
-   * later). macOS: a `WKURLSchemeHandler` for the schemes `webview` and
-   * `webview-frames`. Linux: accepted; not served.
+   * The handler may replace or clear itself, or destroy the webview, from
+   * inside its own call; the callback it runs in is closed only after that
+   * call returns, and a destroy finishes then too (see
+   * {@link Webview.destroy}). A destroyed webview throws
+   * `WEBVIEW_ERROR_INVALID_STATE` (code -3).
+   *
+   * Windows: WebView2's `WebResourceRequested`, deferred until completed.
+   * Where the Runtime has `ICoreWebView2_22` (Runtime 122.0.2365.46 or later,
+   * SDK 1.0.2365.46; the library is built with SDK 1.0.2478.35) requests from
+   * service workers, shared workers and cross-origin iframes are caught too;
+   * an older Runtime's legacy filter misses those. macOS: a
+   * `WKURLSchemeHandler` for the schemes `webview` and `webview-frames`.
+   * Linux: accepted; not served.
    *
    * ## Example
    *
@@ -619,87 +785,98 @@ export class Webview {
    */
   setRequestHandler(handler: RequestHandler | null) {
     const symbols = (requestLib ??= openRequestLib()).symbols;
+    const handle = this.#liveHandle("webview_set_request_handler");
+    closeReleasedCallbacks();
     const previous = this.#requestCallback;
     if (!handler) {
       check(
         "webview_set_request_handler",
-        symbols.webview_set_request_handler(this.#handle, null, null),
+        symbols.webview_set_request_handler(handle, null, null),
       );
       this.#requestCallback = null;
-      previous?.close();
+      // Deferred when the handler clears itself from inside its own call.
+      previous?.release();
       return;
     }
-    const callback = new JSCallback(
-      (
-        id: bigint,
-        methodPtr: Pointer | null,
-        urlPtr: Pointer | null,
-        headersPtr: Pointer | null,
-        bodyPtr: Pointer | null,
-        bodyLen: bigint,
-      ) => {
-        let request: WebviewRequest;
-        try {
-          const length = Number(bodyLen);
-          request = {
-            id: BigInt(id),
-            method: methodPtr ? new CString(methodPtr).toString() : "GET",
-            url: urlPtr ? new CString(urlPtr).toString() : "",
-            headers: headersPtr
-              ? JSON.parse(new CString(headersPtr).toString())
-              : [],
-            // Copied: the pointer is valid only during this call.
-            body:
-              bodyPtr && length > 0
-                ? new Uint8Array(toArrayBuffer(bodyPtr, 0, length)).slice()
-                : null,
-          };
-        } catch {
-          this.#completeQuietly(BigInt(id), { status: 500 });
-          return;
-        }
-        let result: ReturnType<RequestHandler>;
-        try {
-          result = handler(request);
-        } catch {
-          this.#completeQuietly(request.id, { status: 500 });
-          return;
-        }
-        if (result instanceof Promise) {
-          result.then(
-            (response) => {
-              if (response) this.#completeQuietly(request.id, response);
-            },
-            () => this.#completeQuietly(request.id, { status: 500 }),
-          );
-        } else if (result) {
-          this.#completeQuietly(request.id, result);
-        }
-      },
-      {
-        args: [
-          FFIType.u64,
-          FFIType.ptr,
-          FFIType.ptr,
-          FFIType.ptr,
-          FFIType.ptr,
-          FFIType.u64,
-          FFIType.ptr,
-        ],
-        returns: FFIType.void,
-      },
+    const onRequest = (
+      id: bigint,
+      methodPtr: Pointer | null,
+      urlPtr: Pointer | null,
+      headersPtr: Pointer | null,
+      bodyPtr: Pointer | null,
+      bodyLen: bigint,
+    ) => {
+      // Destroyed from inside an earlier call: webview_destroy releases it.
+      if (!this.#handle) return;
+      let request: WebviewRequest;
+      try {
+        const length = Number(bodyLen);
+        request = {
+          id: BigInt(id),
+          method: methodPtr ? new CString(methodPtr).toString() : "GET",
+          url: urlPtr ? new CString(urlPtr).toString() : "",
+          headers: headersPtr
+            ? JSON.parse(new CString(headersPtr).toString())
+            : [],
+          // Copied: the pointer is valid only during this call.
+          body:
+            bodyPtr && length > 0
+              ? new Uint8Array(toArrayBuffer(bodyPtr, 0, length)).slice()
+              : null,
+        };
+      } catch {
+        this.#completeQuietly(BigInt(id), { status: 500 });
+        return;
+      }
+      let result: ReturnType<RequestHandler>;
+      try {
+        result = handler(request);
+      } catch {
+        this.#completeQuietly(request.id, { status: 500 });
+        return;
+      }
+      if (result instanceof Promise) {
+        result.then(
+          (response) => {
+            if (response) this.#completeQuietly(request.id, response);
+          },
+          () => this.#completeQuietly(request.id, { status: 500 }),
+        );
+      } else if (result) {
+        this.#completeQuietly(request.id, result);
+      }
+    };
+    const callback = new NativeCallback(
+      (native) =>
+        new JSCallback(
+          (...args: Parameters<typeof onRequest>) =>
+            native.enter(() => onRequest(...args)),
+          {
+            args: [
+              FFIType.u64,
+              FFIType.ptr,
+              FFIType.ptr,
+              FFIType.ptr,
+              FFIType.ptr,
+              FFIType.u64,
+              FFIType.ptr,
+            ],
+            returns: FFIType.void,
+          },
+        ),
     );
     const code = symbols.webview_set_request_handler(
-      this.#handle,
+      handle,
       callback.ptr,
       null,
     );
     if (code !== 0) {
-      callback.close();
+      callback.release();
       throw new WebviewError("webview_set_request_handler", code);
     }
     this.#requestCallback = callback;
-    previous?.close();
+    // Deferred when the handler replaces itself from inside its own call.
+    previous?.release();
   }
 
   /**
@@ -776,56 +953,77 @@ export class Webview {
    * that carry no files, are untouched. Pass `null` to hand drops back to the
    * page. Runs on the webview's thread, inside {@link Webview.run}.
    *
-   * The handler may call `setFileDropHandler(null)`, open a dialog, or
-   * {@link Webview.destroy} the webview.
+   * On Windows and macOS alike the handler needs external drops allowed
+   * (see {@link Webview.setAllowExternalDrop}) and runs asynchronously, after
+   * the operating system's drop event has returned, so it may call
+   * `setFileDropHandler(null)` or set another handler, open a dialog, or
+   * {@link Webview.destroy} the webview; the callback it runs in is closed
+   * only after that call returns, and a destroy finishes then too. It never
+   * gets an empty list.
    *
    * Windows: drops are captured only on the trusted top-level document,
    * never inside an `<iframe>`. The drop's `File` objects go to the host with
    * `chrome.webview.postMessageWithAdditionalObjects`, whose
-   * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later, with
-   * external drop allowed; see {@link Webview.setAllowExternalDrop}). macOS:
-   * the `WKWebView` takes drags whose pasteboard holds file URLs. Linux:
+   * `ICoreWebView2File` gives each path (WebView2 Runtime 113 or later).
+   * macOS: the library's `WKWebView` subclass takes a drag whose pasteboard
+   * holds file URLs and whose source allows copying, reads the paths when
+   * the drop is performed, and leaves every other drag to WebKit. Linux:
    * accepted; does nothing.
+   *
+   * @throws {WebviewError} The library refused the change; the previous
+   * handler stays in place. A destroyed webview throws
+   * `WEBVIEW_ERROR_INVALID_STATE` (code -3).
    */
   setFileDropHandler(handler: FileDropHandler | null) {
-    const symbols = (streamLib ??= openStreamLib()).symbols;
+    const symbols = (fileDropLib ??= openFileDropLib()).symbols;
+    const handle = this.#liveHandle("webview_set_file_drop_handler");
+    closeReleasedCallbacks();
     const previous = this.#fileDropCallback;
     if (!handler) {
       check(
         "webview_set_file_drop_handler",
-        symbols.webview_set_file_drop_handler(this.#handle, null, null),
+        symbols.webview_set_file_drop_handler(handle, null, null),
       );
       this.#fileDropCallback = null;
-      previous?.close();
+      // Deferred when the handler clears itself from inside its own call.
+      previous?.release();
       return;
     }
-    const callback = new JSCallback(
-      (pathsPtr: Pointer | null) => {
-        let paths: string[];
-        try {
-          paths = pathsPtr ? JSON.parse(new CString(pathsPtr).toString()) : [];
-        } catch {
-          return;
-        }
-        try {
-          handler(paths);
-        } catch {
-          // Nothing may unwind into the library.
-        }
-      },
-      { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.void },
+    const onDrop = (pathsPtr: Pointer | null) => {
+      // Destroyed from inside an earlier call.
+      if (!this.#handle) return;
+      let paths: string[];
+      try {
+        paths = pathsPtr ? JSON.parse(new CString(pathsPtr).toString()) : [];
+      } catch {
+        return;
+      }
+      try {
+        handler(paths);
+      } catch {
+        // Nothing may unwind into the library.
+      }
+    };
+    const callback = new NativeCallback(
+      (native) =>
+        new JSCallback(
+          (pathsPtr: Pointer | null) => native.enter(() => onDrop(pathsPtr)),
+          { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.void },
+        ),
     );
     const code = symbols.webview_set_file_drop_handler(
-      this.#handle,
+      handle,
       callback.ptr,
       null,
     );
     if (code !== 0) {
-      callback.close();
+      // The library kept the previous handler (the change is transactional).
+      callback.release();
       throw new WebviewError("webview_set_file_drop_handler", code);
     }
     this.#fileDropCallback = callback;
-    previous?.close();
+    // Deferred when the handler replaces itself from inside its own call.
+    previous?.release();
   }
 
   // For responses produced from the handler: a bad response becomes a 500
@@ -844,14 +1042,24 @@ export class Webview {
 
   /**
    * Sets whether files and other content dragged from outside the app can be
-   * dropped on the page. Allowed by default. Windows:
-   * `ICoreWebView2Controller4::AllowExternalDrop`. macOS, Linux: accepted;
-   * does nothing.
+   * dropped on the page. Allowed by default. Drags that start inside the page
+   * keep working either way. A {@link Webview.setFileDropHandler file drop
+   * handler} receives drops only while external drops are allowed.
+   *
+   * Windows: `ICoreWebView2Controller4::AllowExternalDrop`, for the whole
+   * WebView2 control (a Runtime without it throws `WEBVIEW_ERROR_UNSPECIFIED`,
+   * code -1). macOS: enforced by the library's `WKWebView` subclass, which
+   * refuses drags from other apps (`NSDraggingInfo.draggingSource` is nil,
+   * such as from Finder) while still handing in-app drags to WebKit. Linux:
+   * accepted; does nothing.
+   *
+   * @throws {WebviewError} The platform refused the change.
    */
   setAllowExternalDrop(allow: boolean) {
     check(
       "webview_set_allow_external_drop",
-      (requestLib ??= openRequestLib()).symbols.webview_set_allow_external_drop(
+      (externalDropLib ??=
+        openExternalDropLib()).symbols.webview_set_allow_external_drop(
         this.#handle,
         allow ? 1 : 0,
       ),
@@ -859,22 +1067,37 @@ export class Webview {
   }
 
   /**
-   * Sets the color the browser paints behind the page, each channel 0 to 255.
-   * With `a` 0 and a page whose own background is transparent, the native
-   * window shows through.
+   * Sets the color the browser paints behind the page, each channel an
+   * integer from 0 to 255. With `a` 0 and a page whose own background is
+   * transparent, the native window shows through.
    *
-   * Windows: `ICoreWebView2Controller2::DefaultBackgroundColor`; for true
-   * transparency the host window also needs DWM composition that honors alpha.
-   * macOS: `drawsBackground` off on the `WKWebView`, the window non-opaque with
-   * this color behind it. Linux: accepted; does nothing.
+   * Windows: `ICoreWebView2Controller2::DefaultBackgroundColor`. WebView2
+   * takes only `a` of 0 or 255; any other alpha is refused
+   * (`WEBVIEW_ERROR_UNSPECIFIED`, code -1). For true transparency the host
+   * window also needs DWM composition that honors alpha. macOS: the
+   * `WKWebView`'s `drawsBackground` off when `a` is 0 (on otherwise), this
+   * color behind the window, and the window non-opaque unless `a` is 255.
+   * Linux: accepted; does nothing.
+   *
+   * @throws {WebviewError} A channel that is not an integer from 0 to 255
+   * (`WEBVIEW_ERROR_INVALID_ARGUMENT`, code -2, checked before the library
+   * is called, since it takes C ints), or the library's own error.
    */
   setBackgroundColor(r: number, g: number, b: number, a: number) {
-    (forkLib ??= openForkLib()).symbols.webview_set_background_color(
-      this.#handle,
-      r,
-      g,
-      b,
-      a,
+    for (const channel of [r, g, b, a]) {
+      if (!Number.isInteger(channel) || channel < 0 || channel > 255) {
+        throw new WebviewError("webview_set_background_color", -2);
+      }
+    }
+    check(
+      "webview_set_background_color",
+      (forkLib ??= openForkLib()).symbols.webview_set_background_color(
+        this.#handle,
+        r,
+        g,
+        b,
+        a,
+      ),
     );
   }
 
@@ -904,17 +1127,25 @@ export class Webview {
     callback: (seq: string, req: string, arg: Pointer | null) => void,
     arg: Pointer | null = null,
   ) {
-    const callbackResource = new JSCallback(
-      (seqPtr: Pointer, reqPtr: Pointer, arg: Pointer | null) => {
-        const seq = seqPtr ? new CString(seqPtr) : "";
-        const req = reqPtr ? new CString(reqPtr) : "";
-        //@ts-ignore
-        callback(seq, req, arg);
-      },
-      {
-        args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
-        returns: FFIType.void,
-      },
+    // A NativeCallback, so a binding may destroy the webview or unbind
+    // itself from inside its own call.
+    const callbackResource = new NativeCallback(
+      (native) =>
+        new JSCallback(
+          (seqPtr: Pointer, reqPtr: Pointer, arg: Pointer | null) =>
+            native.enter(() => {
+              // Destroyed from inside an earlier call.
+              if (!this.#handle) return;
+              const seq = seqPtr ? new CString(seqPtr) : "";
+              const req = reqPtr ? new CString(reqPtr) : "";
+              //@ts-ignore
+              callback(seq, req, arg);
+            }),
+          {
+            args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
+            returns: FFIType.void,
+          },
+        ),
     );
     this.#callbacks.set(name, callbackResource);
     lib.symbols.webview_bind(
@@ -931,6 +1162,19 @@ export class Webview {
    * converted from json to as closely as possible match the arguments in the
    * webview context and the callback automatically converts and returns the
    * return value to the webview.
+   *
+   * Bindings are reachable from the top-level document only; calls posted
+   * from an `<iframe>` are dropped (the library checks the frame).
+   *
+   * Errors and promises: a callback that throws rejects the page's promise
+   * with the thrown value serialized as JSON (an `Error` serializes to `{}`,
+   * so send a string or plain object to keep the message). A returned promise
+   * resolves the page's call when it fulfills, but a rejected promise is not
+   * reported back, so the page's call never settles; catch inside the
+   * callback. Promises settle only when the thread's event loop turns, which
+   * {@link Webview.run} blocks, so an `await` inside a binding does not
+   * complete until `run()` returns; keep bindings synchronous, or hand the
+   * work to a `Worker`.
    *
    * @param name The name of the bound function
    * @param callback A callback which is passed the arguments as called from the
@@ -1003,7 +1247,8 @@ export class Webview {
   unbind(name: string) {
     //@ts-ignore
     lib.symbols.webview_unbind(this.#handle, encodeCString(name));
-    this.#callbacks.get(name)?.close();
+    // Deferred when the binding unbinds itself from inside its own call.
+    this.#callbacks.get(name)?.release();
     this.#callbacks.delete(name);
   }
 
@@ -1037,8 +1282,14 @@ export class Webview {
 
   /**
    * Injects JavaScript code at the initialization of the new page. Every time
-   * the webview will open a the new page - this initialization code will be
-   * executed. It is guaranteed that code is executed before window.onload.
+   * the webview opens a new page this code runs, before `window.onload`.
+   *
+   * Main frame vs subframes differs per platform. macOS adds a `WKUserScript`
+   * for the main frame only, so `<iframe>`s never run it. Windows adds it with
+   * WebView2's `AddScriptToExecuteOnDocumentCreated`, which runs it in every
+   * frame's document, `<iframe>`s (cross-origin too) included; guard code that
+   * belongs to the top-level document with `if (window === window.top)`, as
+   * the library's own bridge and drop scripts do. Linux follows upstream.
    */
   init(source: string) {
     lib.symbols.webview_init(this.#handle, encodeCString(source));

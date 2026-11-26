@@ -11,11 +11,26 @@ sweetview fork of the library adds:
   fetch by relative URL.
 - `Webview.setRequestHandler`: answer the page's requests in code, with no socket, and
   `framesOrigin`, a second origin for cross-origin `<iframe>`s.
-- `Webview.setAllowExternalDrop`: refuse drops from outside the app.
+- Streamed responses: `Webview.beginResponse`, `writeResponseChunk`, `endResponse` (and
+  `beginWebviewResponse`, `writeWebviewResponseChunk`, `endWebviewResponse` for workers): status
+  and headers now, the body in chunks.
+- `Webview.setAllowExternalDrop`: refuse drops from outside the app (Windows and macOS).
+- `Webview.setFileDropHandler`: the real filesystem paths of files dropped from the OS (Windows and
+  macOS).
 - `Webview.setBackgroundColor`: a color, or transparency, behind the page.
 - System-wide mouse and keyboard hooks, with a permission model for macOS.
 
 Every API is documented under [`docs/`](docs/).
+
+The fork's additions are implemented on Windows and macOS. On Linux the calls exist (the library
+keeps upstream webview/webview's C ABI) and are accepted without effect, except the input hooks,
+which throw.
+
+> [!IMPORTANT]
+> Only `build/libwebview.dll` is built from current source. `build/libwebview.dylib` and
+> `build/libwebview-x64.so` predate the 2.8.0 additions (request handler, streaming, external drop,
+> file drops): rebuild the dylib on macOS with `just build` before using them there. See
+> [Shipped binaries](docs/requests.md#shipped-binaries).
 
 ## Installation
 
@@ -119,7 +134,7 @@ bun build --compile --minify --sourcemap ./index.ts ./worker.ts --outfile webser
 | ------------------------------------------------------ | ------------------------------------------------------------------------------ |
 | [The `Webview` class](docs/webview.md)                 | Creating a window, loading content, bindings between bun and the page, running |
 | [Assets and background](docs/assets-and-background.md) | `setAsset` (serve files at the webview's own origin), `setBackgroundColor`     |
-| [Requests and drops](docs/requests.md)                 | `setRequestHandler`, `completeRequest`, `framesOrigin`, `setAllowExternalDrop` |
+| [Requests and drops](docs/requests.md)                 | `setRequestHandler`, `completeRequest`, streaming (`beginResponse`, `writeResponseChunk`, `endResponse` and their worker functions), `framesOrigin`, `setAllowExternalDrop`, `setFileDropHandler` |
 | [Input hooks](docs/input-hooks.md)                     | System-wide mouse and keyboard hooks, the permission model for macOS           |
 
 [`docs/`](docs/) has the same list. Each member is also documented where it is declared, in `src/`.
@@ -134,12 +149,14 @@ Please use `bun pretty` to automatically format all files.
 
 ### Prerequisites
 
-#### 🪟 On **Windows,** you need C++ Build Tools:
+#### 🪟 On **Windows,** you need C++ Build Tools, CMake, Ninja, just and PowerShell 7:
 
 - Go to https://visualstudio.microsoft.com/downloads.
 - Scroll down > _All Downloads_ > _Tools for Visual Studio_.
-- Download _Build Tools for Visual Studio 2022_ and run.
+- Download _Build Tools for Visual Studio 2022_ (or later) and run.
 - Select _Desktop development with C++_ and install.
+- CMake and Ninja on `PATH`: `winget install Kitware.CMake Ninja-build.Ninja`.
+- [just](https://github.com/casey/just) and `pwsh`: `winget install Casey.Just Microsoft.PowerShell`.
 
 #### 🐧 On linux, you need following deps:
 
@@ -167,14 +184,18 @@ brew install cmake ninja clang
   > Under the hood, it invokes webview's own cmake build system to compile the shared library file.
 
   ```bash
-  bun run build
+  just build
   ```
+
+  On Windows use `just build`: it enters the Visual Studio dev shell and runs CMake with Ninja.
+  `bun run build` (`scripts/build.ts`) works on macOS and Linux only; on Windows it stops with
+  "on Windows, build with `just build`".
 
 - (Optional) Clear build cache and rebuild the library.
 
   ```bash
-  bun clean
-  bun run build
+  just clean
+  just build
   ```
 
 The compiled library file can be found inside the `build` folder.

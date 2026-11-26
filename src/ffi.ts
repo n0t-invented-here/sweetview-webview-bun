@@ -15,8 +15,16 @@ export function encodeCString(value: string): Uint8Array {
 export const instances: Webview[] = [];
 
 /**
- * Unload the library and destroy all webview instances. Should only be run
- * once all windows are closed.
+ * Destroys every webview instance this process created through `Webview`
+ * (instances already destroyed are skipped) and closes the core library
+ * handle. Should only be run once all windows are closed.
+ *
+ * Scope: it closes only the core symbol table. The fork's feature groups
+ * (assets and background color, the request handler, streaming, external
+ * drop, file drops) and the input hooks and permissions are each opened
+ * lazily with their own `dlopen` and are not closed here; installed mouse or
+ * keyboard hooks are not removed (dispose them first). Nothing in the
+ * package may be called after `unload()`.
  */
 export function unload() {
   for (const instance of instances) instance.destroy();

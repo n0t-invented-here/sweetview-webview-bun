@@ -3,7 +3,12 @@
 // Run by test/request-handler.test.ts in a child process with a timeout.
 // No sockets: every response comes from WebResourceRequested (Windows) or a
 // WKURLSchemeHandler (macOS).
-import { lib } from "../../src/ffi";
+import { CFunction, FFIType } from "bun:ffi";
+import { encodeCString, lib } from "../../src/ffi";
+import {
+  fileDropCallbackPtr,
+  pendingCallbackCloses,
+} from "../../src/internal-test-hooks";
 import {
   completeWebviewRequest,
   Webview,
@@ -41,6 +46,31 @@ webview.setFileDropHandler((paths) => fileDropCalls.push(paths));
 webview.setFileDropHandler(null);
 webview.setFileDropHandler((paths) => fileDropCalls.push(paths));
 report.fileDropSetClear = "ok";
+
+// A file drop handler that clears itself from inside its own call. Its
+// JSCallback is called through the native pointer, the way the library calls
+// it, so the clear happens while native code is inside the trampoline: the
+// close must wait until the call has returned.
+{
+  const reentrant: Record<string, unknown> = { calls: 0 };
+  webview.setFileDropHandler((paths) => {
+    reentrant.calls = (reentrant.calls as number) + 1;
+    reentrant.paths = paths;
+    webview.setFileDropHandler(null);
+    reentrant.pendingInsideCall = pendingCallbackCloses();
+  });
+  const call = new CFunction({
+    ptr: fileDropCallbackPtr(webview)!,
+    args: [FFIType.ptr, FFIType.ptr],
+    returns: FFIType.void,
+  });
+  call(encodeCString(JSON.stringify(["/reentrant"])), null);
+  reentrant.pendingAfterReturn = pendingCallbackCloses();
+  // The next change, outside any call, closes it.
+  webview.setFileDropHandler((paths) => fileDropCalls.push(paths));
+  reentrant.pendingAfterNextSet = pendingCallbackCloses();
+  report.reentrantDrop = reentrant;
+}
 
 // The asset table still answers first, untouched by the handler.
 webview.setAsset(
@@ -183,7 +213,7 @@ const page = `<!doctype html>
         r.sw = { error: String(e) };
       }
     }
-    // Left open on purpose: destroying the webview must answer and release it.
+    // Left open on purpose: destroying the webview must release it unanswered.
     fetch("/never").catch(() => {});
   } catch (e) {
     r.error = String(e && e.stack || e);
@@ -317,7 +347,7 @@ webview.setRequestHandler((req: WebviewRequest) => {
     };
   }
   if (!isFrames && url.pathname === "/never") {
-    // Never answered; webview_destroy answers it 503 and releases it.
+    // Never answered; webview_destroy releases it unanswered.
     report.neverOpened = true;
     finishWhenDone();
     return;

@@ -10,6 +10,7 @@ import { libraryPath } from "../src/ffi";
 import {
   beginWebviewResponse,
   completeWebviewRequest,
+  Webview,
   WebviewError,
   writeWebviewResponseChunk,
 } from "../src/index";
@@ -139,6 +140,24 @@ describe("argument checks in the bindings", () => {
     }
   });
 
+  test("setBackgroundColor refuses a channel that is not an integer from 0 to 255 with -2 before the FFI call", () => {
+    // No webview behind it (new Webview(handle) would call webview_set_size
+    // on the handle): the channels are refused before the handle is read.
+    const webview = Object.create(Webview.prototype) as Webview;
+    const bad = [-1, 256, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 4294967296];
+    for (const value of bad) {
+      for (const channel of [0, 1, 2, 3]) {
+        const rgba = [0, 0, 0, 255];
+        rgba[channel] = value;
+        expect(
+          thrown(() =>
+            webview.setBackgroundColor(rgba[0]!, rgba[1]!, rgba[2]!, rgba[3]!),
+          ),
+        ).toEqual({ fn: "webview_set_background_color", code: -2 });
+      }
+    }
+  });
+
   test("an empty chunk against a destroyed handle is refused with -3, like any chunk", () => {
     for (const chunk of [new Uint8Array(0), new ArrayBuffer(0), "", "x"]) {
       expect(
@@ -148,44 +167,50 @@ describe("argument checks in the bindings", () => {
   });
 });
 
+// Runs a fixture in a child process with a timeout (a hang fails the test
+// rather than the run) and returns its `RESULT <json>` line, parsed.
+function runFixture(name: string, args: string[] = [], timeout = 60_000) {
+  const fixture = new URL(`./fixtures/${name}`, import.meta.url).pathname.replace(
+    /^\/([A-Za-z]:)/,
+    "$1",
+  );
+  // Its own WebView2 user data folder: the default one (%APPDATA%\bun.exe)
+  // is shared with every other Bun process that opens a webview, and
+  // WebView2 refuses a second environment on a folder in use.
+  const userData = mkdtempSync(join(tmpdir(), "sweetview-webview-bun-"));
+  let proc;
+  try {
+    proc = Bun.spawnSync([process.execPath, fixture, ...args], {
+      timeout,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: userData },
+    });
+  } finally {
+    try {
+      rmSync(userData, { recursive: true, force: true });
+    } catch {
+      // WebView2's child processes can hold files for a moment.
+    }
+  }
+  const stdout = proc.stdout.toString();
+  const stderr = proc.stderr.toString();
+  const line = stdout.split(/\r?\n/).find((l) => l.startsWith("RESULT "));
+  if (!line) {
+    throw new Error(
+      `fixture ${name} ${args.join(" ")} gave no result (exit ${proc.exitCode}, signal ${proc.signalCode})\n${stdout}\n${stderr}`,
+    );
+  }
+  return { r: JSON.parse(line.slice("RESULT ".length)), exitCode: proc.exitCode };
+}
+
 describe.if(process.platform === "win32" || process.platform === "darwin")(
   "live webview",
   () => {
     test("dynamic HTML, POST echo, binary image, cross-origin iframe, static assets", () => {
-      const fixture = new URL(
-        "./fixtures/live-request-handler.ts",
-        import.meta.url,
-      ).pathname.replace(/^\/([A-Za-z]:)/, "$1");
-      // Its own WebView2 user data folder: the default one (%APPDATA%\bun.exe)
-      // is shared with every other Bun process that opens a webview, and
-      // WebView2 refuses a second environment on a folder in use.
-      const userData = mkdtempSync(join(tmpdir(), "sweetview-webview-bun-"));
-      let proc;
-      try {
-        proc = Bun.spawnSync([process.execPath, fixture], {
-          timeout: 60_000,
-          stdout: "pipe",
-          stderr: "pipe",
-          env: { ...process.env, WEBVIEW2_USER_DATA_FOLDER: userData },
-        });
-      } finally {
-        try {
-          rmSync(userData, { recursive: true, force: true });
-        } catch {
-          // WebView2's child processes can hold files for a moment.
-        }
-      }
-      const stdout = proc.stdout.toString();
-      const stderr = proc.stderr.toString();
-      const line = stdout.split(/\r?\n/).find((l) => l.startsWith("RESULT "));
-      if (!line) {
-        throw new Error(
-          `fixture gave no result (exit ${proc.exitCode}, signal ${proc.signalCode})\n${stdout}\n${stderr}`,
-        );
-      }
-      const r = JSON.parse(line.slice("RESULT ".length));
+      const { r, exitCode } = runFixture("live-request-handler.ts");
       // run() returned, the webview was destroyed with a request still open, and the process exited cleanly.
-      expect(proc.exitCode).toBe(0);
+      expect(exitCode).toBe(0);
       console.log(JSON.stringify(r, null, 2));
       const p = r.page;
       const origin = r.assetOrigin;
@@ -195,6 +220,17 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(r.externalDrop).toBe("ok");
       // webview_set_file_drop_handler registers and clears without error.
       expect(r.fileDropSetClear).toBe("ok");
+      // A file drop handler that clears itself from inside its own call
+      // (called through its native pointer, as the library calls it): the
+      // callback it runs in waits until the call returns, then closes on the
+      // next handler change.
+      expect(r.reentrantDrop).toEqual({
+        calls: 1,
+        paths: ["/reentrant"],
+        pendingInsideCall: 1,
+        pendingAfterReturn: 1,
+        pendingAfterNextSet: 0,
+      });
 
       // Dynamic HTML from the handler at the main origin.
       expect(p.parentOrigin).toBe(origin);
@@ -317,7 +353,9 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
         expect(r.fileDropCalls).toEqual([]);
       }
 
-      // A request still open when the webview is destroyed is answered and released.
+      // A request still open when the webview is destroyed is released
+      // unanswered (Windows: the deferral is released without Complete();
+      // macOS: the task is released and WebKit stops it), and run() returns.
       expect(r.neverOpened).toBe(true);
       expect(paths).toContain("/never");
 
@@ -330,6 +368,84 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(r.afterDestroyMethod).toBe(-3);
       // An empty chunk after destroy is refused with -3, not skipped.
       expect(r.emptyChunkAfterDestroy).toBe(-3);
+    }, 90_000);
+  },
+);
+
+// Replacing, clearing and destroying from inside the handlers' own calls.
+// Each scenario runs in its own process with a timeout, so a teardown that
+// hangs (webview_destroy run inside WebView2's WebResourceRequested) fails
+// here.
+describe.if(process.platform === "win32" || process.platform === "darwin")(
+  "live webview: changes from inside a handler's own call",
+  () => {
+    // What a destroyed webview answers: WEBVIEW_ERROR_INVALID_STATE (-3).
+    const destroyedCodes = {
+      completeRequest: -3,
+      setRequestHandler: -3,
+      setFileDropHandler: -3,
+    };
+
+    test("the request handler replaces itself, then the replacement clears itself", () => {
+      const { r, exitCode } = runFixture("live-callback-teardown.ts", [
+        "request-replace-clear",
+      ]);
+      expect(exitCode).toBe(0);
+      expect(r.page).toEqual([
+        { path: "/a", status: 200, body: "from-A" },
+        { path: "/b", status: 200, body: "from-B" },
+        // No handler: the library answers 404.
+        { path: "/c", status: 404, body: expect.any(String) },
+      ]);
+      // /a went to A, /b to its replacement B, /c to neither.
+      expect(r.calls).toContain("A/a");
+      expect(r.calls).toContain("B/b");
+      expect(r.calls).not.toContain("A/b");
+      expect(r.calls.filter((c: string) => c.endsWith("/c"))).toEqual([]);
+      // Each released callback waited for its own call to return...
+      expect(r.pendingAfterReplaceInsideCall).toBe(1);
+      expect(r.pendingAfterClearInsideCall).toBe(1);
+      // ...and every one was closed by the end.
+      expect(r.pendingAtEnd).toBe(0);
+    }, 90_000);
+
+    test("the request handler destroys the webview from inside WebResourceRequested without hanging", () => {
+      const { r, exitCode } = runFixture("live-callback-teardown.ts", [
+        "request-destroy",
+      ]);
+      expect(exitCode).toBe(0);
+      expect(r.destroyedInsideCall).toBe(true);
+      // Destroyed at once, inside the call: every checked API throws -3.
+      expect(r.insideCall).toEqual(destroyedCodes);
+      // run() returned and the deferred teardown ran.
+      expect(r.runReturned).toBe(true);
+      expect(r.afterRun).toEqual(destroyedCodes);
+      // Nothing reached the handler once it had destroyed the webview, and
+      // the page never got to finish.
+      expect(r.callsAfterDestroy).toBe(0);
+      expect(r.pageFinished).toBeUndefined();
+      expect(r.pendingAtEnd).toBe(0);
+    }, 90_000);
+
+    test("the file drop handler replaces itself, clears itself, and destroys the webview from inside its call", () => {
+      const { r, exitCode } = runFixture("live-callback-teardown.ts", [
+        "drop-replace-clear-destroy",
+      ]);
+      expect(exitCode).toBe(0);
+      expect(r.firstCalled).toBe(true);
+      expect(r.secondCalled).toBe(true);
+      expect(r.thirdCalled).toBe(true);
+      expect(r.fourthCalled).toBe(true);
+      // A ran once and handed over to B, which ran once and cleared itself;
+      // C destroyed the webview and was not called again.
+      expect(r.drops).toEqual(["A:/one", "B:/two", "C:/three"]);
+      expect(r.ptrAfterClear).toBe(true);
+      expect(r.pendingAfterReplaceInsideCall).toBe(1);
+      expect(r.pendingAfterClearInsideCall).toBe(1);
+      expect(r.insideCall).toEqual(destroyedCodes);
+      expect(r.runReturned).toBe(true);
+      expect(r.afterRun).toEqual(destroyedCodes);
+      expect(r.pendingAtEnd).toBe(0);
     }, 90_000);
   },
 );
