@@ -153,9 +153,8 @@ const page = `<!doctype html>
     // Server-Sent Events streamed from a worker (webview_begin_response,
     // webview_write_response_chunk, webview_end_response). Each event is
     // acknowledged to the host; the worker records whether the ack came
-    // before it wrote the next event. Windows only for now: WebKit's
-    // EventSource over a custom scheme is not covered by this test.
-    if (isWindows) {
+    // before it wrote the next event.
+    {
       r.sse = await new Promise((resolve) => {
         const events = [];
         const es = new EventSource("/sse");
@@ -308,7 +307,10 @@ webview.setRequestHandler((req: WebviewRequest) => {
   seen.push({ method: req.method, url: req.url });
   if (process.env.SV_DEBUG) console.error("handler", req.method, req.url);
   const url = new URL(req.url);
-  const isFrames = url.origin === frames;
+  // Not url.origin: WHATWG URL gives "null" as the origin of every scheme it
+  // does not treat as special, and macOS serves the frames origin from the
+  // custom scheme webview-frames:, so that comparison is never true there.
+  const isFrames = req.url.startsWith(`${frames}/`);
   if (isFrames && url.pathname === "/sandbox.html") {
     return {
       headers: { "Content-Type": "text/html; charset=utf-8" },

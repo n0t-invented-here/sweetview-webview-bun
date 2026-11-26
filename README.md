@@ -27,9 +27,9 @@ keeps upstream webview/webview's C ABI) and are accepted without effect, except 
 which throw.
 
 > [!IMPORTANT]
-> Only `build/libwebview.dll` is built from current source. `build/libwebview.dylib` and
-> `build/libwebview-x64.so` predate the 2.8.0 additions (request handler, streaming, external drop,
-> file drops): rebuild the dylib on macOS with `just build` before using them there. See
+> `build/libwebview.dll` and `build/libwebview.dylib` are built from current source.
+> `build/libwebview-x64.so` predates the 2.8.0 additions (request handler, streaming, external drop,
+> file drops), none of which Linux implements. See
 > [Shipped binaries](docs/requests.md#shipped-binaries).
 
 ## Installation

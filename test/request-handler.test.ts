@@ -309,7 +309,7 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(p.missingStatus).toBe(404);
       expect(paths).toContain("/nothing-here");
 
-      if (process.platform === "win32") {
+      {
         // Server-Sent Events streamed from a worker, no socket: all three
         // arrive in order, as separate events (event 2 was written in two
         // halves, 100 ms apart), over one connection, with no reconnect.
@@ -323,24 +323,42 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
         ]);
         expect(paths.filter((q: string) => q === "/sse")).toHaveLength(1);
         const last = sse.events[2].data;
-        // WebView2 hands the page an intercepted response only once its body
-        // has ended (WebView2Feedback #3519; the ICoreWebView2WebResource-
-        // Response docs require all content by the time the deferral
-        // completes), so every event arrives together, after the last write.
-        // If a future WebView2 Runtime delivers partial bodies, the page acks
-        // event 1 before event 2 is written and these flip: update the docs
-        // of webview_begin_response then.
-        expect(last.ack1BeforeEvent2).toBe(false);
-        expect(last.ack2BeforeEvent3).toBe(false);
-        expect(sse.events[0].receivedAt).toBeGreaterThanOrEqual(last.writtenAt);
+        if (process.platform === "win32") {
+          // WebView2 hands the page an intercepted response only once its
+          // body has ended (WebView2Feedback #3519; the ICoreWebView2Web-
+          // ResourceResponse docs require all content by the time the
+          // deferral completes), so every event arrives together, after the
+          // last write. If a future WebView2 Runtime delivers partial bodies,
+          // the page acks event 1 before event 2 is written and these flip:
+          // update the docs of webview_begin_response then.
+          expect(last.ack1BeforeEvent2).toBe(false);
+          expect(last.ack2BeforeEvent3).toBe(false);
+          expect(sse.events[0].receivedAt).toBeGreaterThanOrEqual(
+            last.writtenAt,
+          );
+        } else {
+          // WKURLSchemeTask delivers each didReceiveData: as it is written:
+          // the page had event 1 and acknowledged it before event 2 was
+          // written, and event 2 before event 3, long before the stream
+          // ended.
+          expect(last.ack1BeforeEvent2).toBe(true);
+          expect(last.ack2BeforeEvent3).toBe(true);
+          expect(sse.events[0].receivedAt).toBeLessThan(
+            sse.events[1].data.writtenAt,
+          );
+          expect(sse.events[1].receivedAt).toBeLessThan(last.writtenAt);
+        }
         // Bad header JSON, a bad status and a NULL chunk with a length are
-        // refused (-2) before anything is sent; a second begin for the same
-        // request is WEBVIEW_ERROR_DUPLICATE (1).
+        // refused (-2) before anything is sent. A second begin for the same
+        // request is WEBVIEW_ERROR_DUPLICATE (1) on Windows; macOS accepts
+        // and ignores it.
         expect(last.badBegin).toBe(-2);
         expect(last.badStatus).toBe(-2);
         expect(last.badChunk).toBe(-2);
-        expect(last.duplicateBegin).toBe(1);
+        expect(last.duplicateBegin).toBe(process.platform === "win32" ? 1 : 0);
+      }
 
+      if (process.platform === "win32") {
         // OS file drops: the drop script ran enabled, took a drop carrying
         // files from the page, and let go of drops once the handler was
         // cleared. A File made in script has no path, so the handler never

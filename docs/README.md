@@ -9,7 +9,7 @@
 
 - Install, build and package instructions: the [README](../README.md).
 - The 2.8.0 additions (requests, streaming, drops) are implemented on Windows and macOS; the
-  checked-in macOS and Linux binaries predate them (see
+  checked-in Linux binary predates them (see
   [Shipped binaries](requests.md#shipped-binaries)).
 - The C library these bindings wrap: [sweetview-webview](https://github.com/n0t-invented-here/sweetview-webview);
   its additions are documented in its [`sweetview/`](https://github.com/n0t-invented-here/sweetview-webview/tree/sweetview/sweetview) folder.

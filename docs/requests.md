@@ -6,8 +6,8 @@ origin, control drops from outside the app, and receive the paths of files dropp
 Nothing reaches the network and no socket is opened.
 
 Implemented on Windows (WebView2) and macOS (WKWebView). On Linux the calls exist, for the C ABI the
-library shares with upstream webview/webview, and are accepted without effect. The checked-in macOS
-and Linux binaries predate these additions; see [Shipped binaries](#shipped-binaries).
+library shares with upstream webview/webview, and are accepted without effect. The checked-in Linux
+binary predates these additions; see [Shipped binaries](#shipped-binaries).
 
 ## `setRequestHandler(handler)`
 
@@ -46,6 +46,23 @@ The handler gets a `WebviewRequest`:
 | `url`     | The full URL, query string included                                         |
 | `headers` | `[name, value]` pairs in the order the browser sent them; a name may repeat |
 | `body`    | A `Uint8Array` copy of the request body, or `null`                          |
+
+macOS: WebKit hands the request handler only the parts of a body the page holds in memory. A body
+that is a `Blob`, or a `FormData` containing a `File` or `Blob`, arrives as `null`, from `fetch` and
+`XMLHttpRequest` alike. Strings, `ArrayBuffer` and typed arrays, `URLSearchParams`, and a `FormData`
+of text fields arrive whole. A page that uploads files reads them first, which works on both
+platforms:
+
+```js
+await fetch("/upload", { method: "POST", body: await blob.arrayBuffer() });
+
+const encoded = new Response(formData); // multipart/form-data, files included
+await fetch("/upload", {
+  method: "POST",
+  headers: { "Content-Type": encoded.headers.get("Content-Type") },
+  body: await encoded.arrayBuffer(),
+});
+```
 
 It answers in one of three ways:
 
@@ -282,8 +299,9 @@ from `framesOrigin`, that `setAsset` assets still answer first, a service worker
 reaching the handler, bad response headers (`{"X-Example":trueish}`, an escaped NUL, a name with a
 space, a lone surrogate, CR LF) refused with -2, `completeWebviewRequest` after the webview is
 destroyed refused with -3 from the main thread and from a worker (as is `completeRequest` after
-`destroy()`), a Server-Sent Events stream written from a worker with its chunk timing, refused
-stream arguments and a duplicate begin, and `setAllowExternalDrop` both ways.
+`destroy()`), a Server-Sent Events stream written from a worker with its chunk timing (each event
+reaches the page before the next is written on macOS; all together after the end on Windows),
+refused stream arguments and a duplicate begin, and `setAllowExternalDrop` both ways.
 
 What the file drop tests cover, and what they do not:
 
@@ -292,14 +310,15 @@ What the file drop tests cover, and what they do not:
   Windows, a synthetic drop: the page dispatches a `drop` event carrying a `File` it built, and the
   test checks that the drop script took it while a handler was set and let it go once cleared. A
   scripted `File` has no filesystem path, so the handler itself is not called there.
-- Not covered: a real drag from Explorer or Finder, and the macOS drag routing. Those are checked by
-  hand.
+- Not covered here: a real drag from Explorer or Finder. The macOS drag routing is covered by the
+  library's own tests (`ctest` in the `webview/` submodule), which call the `WKWebView` subclass's
+  drag methods with a stand-in for the drag: a file drop taken and delivered, refused external
+  drags, and external drops or the handler switched off mid-drag.
 
 Without a window, `bun test` also checks the exports and argument checks of every call, including
 `setBackgroundColor` refusing channels that are not integers from 0 to 255. The service worker check
 runs on Windows only: WebKit allows service workers only on `http:` and `https:` origins, not on the
-`webview:` scheme macOS serves from. The live test on macOS needs a dylib rebuilt from current
-source (see [Shipped binaries](#shipped-binaries)).
+`webview:` scheme macOS serves from.
 
 ## Shipped binaries
 
@@ -309,8 +328,12 @@ The library is built from the `webview/` submodule (sweetview-webview) and check
 | File                        | Built from                                   | Has the 2.8.0 additions (request handler, streaming, external drop, file drops) |
 | --------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------- |
 | `build/libwebview.dll`      | Current source, on Windows                   | Yes                                                                             |
-| `build/libwebview.dylib`    | An older fork commit (webview `3ad63f3`)     | No: rebuild it on macOS with `just build` before relying on them                |
+| `build/libwebview.dylib`    | Current source, on macOS (arm64 + x86_64)    | Yes                                                                             |
 | `build/libwebview-x64.so`   | An older fork commit                         | No (and Linux implements none of them; see below)                               |
+
+The dylib is built on macOS 27 with no deployment target set, so it declares macOS 27.0 as its
+minimum; the x86_64 half is compiled and linked but has not been run (the build machine is arm64
+without Rosetta).
 
 Assets, background color, the input hooks and permissions are in all three. Each 2.8.0 feature is
 bound lazily and on its own, so a binary without one still serves everything else; calling a missing
