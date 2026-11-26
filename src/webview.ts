@@ -3,7 +3,6 @@ import {
   dlopen,
   FFIType,
   JSCallback,
-  ptr,
   toArrayBuffer,
   type Pointer,
 } from "bun:ffi";
@@ -86,8 +85,12 @@ export interface WebviewResponse {
   status?: number;
   /**
    * Response headers: an object of name to value, or `[name, value]` pairs,
-   * which allow a name to repeat (`Set-Cookie`). CR and LF are removed from
-   * names and values.
+   * which allow a name to repeat. Each name must be an RFC 9110 token and each
+   * value free of CR, LF, NUL and other control characters but tab; anything
+   * else throws a {@link WebviewError} (`WEBVIEW_ERROR_INVALID_ARGUMENT`) and
+   * answers nothing. Windows sends every pair as its own header line; macOS
+   * (`NSHTTPURLResponse`) joins repeated names with `", "` and keeps only the
+   * first `Set-Cookie`, so at most one `Set-Cookie` per response there.
    */
   headers?: Record<string, string> | [name: string, value: string][];
   /** The body; a string is encoded as UTF-8. */
@@ -120,8 +123,16 @@ function responseBodyBytes(body: WebviewResponse["body"]): Uint8Array | null {
  * this returns. Completing a request twice, or one the browser has since
  * cancelled, does nothing.
  *
+ * Safe against the webview being destroyed on another thread: once
+ * {@link Webview.destroy} has begun this throws a {@link WebviewError}
+ * (`WEBVIEW_ERROR_INVALID_STATE`, code -3) instead of touching freed memory,
+ * and an answer queued just before then does nothing. Still stop the worker
+ * before destroying the webview, so it does not keep answering into nothing.
+ *
  * @param handle The webview's {@link Webview.unsafeHandle}.
  * @param id The request's {@link WebviewRequest.id}.
+ * @throws {WebviewError} Bad headers (see {@link WebviewResponse.headers}),
+ * a status outside 100-599, a body over 4 GiB - 1, or a destroyed webview.
  */
 export function completeWebviewRequest(
   handle: Pointer,
@@ -129,19 +140,24 @@ export function completeWebviewRequest(
   response: WebviewResponse = {},
 ) {
   const status = response.status ?? 200;
+  // Bound before any buffer is made, and the buffers are passed as typed
+  // arrays (never a numeric ptr(...)), so nothing can collect them before
+  // the library has copied them.
+  const symbols = (requestLib ??= openRequestLib()).symbols;
   const headers = response.headers
     ? encodeCString(JSON.stringify(response.headers))
     : null;
   const body = responseBodyBytes(response.body);
+  const hasBody = body !== null && body.byteLength > 0;
   check(
     "webview_complete_request",
-    (requestLib ??= openRequestLib()).symbols.webview_complete_request(
+    symbols.webview_complete_request(
       handle,
       id,
       status,
       headers,
-      body && body.byteLength > 0 ? ptr(body) : null,
-      BigInt(body?.byteLength ?? 0),
+      hasBody ? body : null,
+      BigInt(hasBody ? body.byteLength : 0),
     ),
   );
 }
@@ -309,7 +325,7 @@ export class Webview {
     for (const callback of this.#callbacks.keys()) this.unbind(callback);
     // Unregister the request handler before the library can call it again;
     // its JSCallback is freed only once the webview is gone. Requests still
-    // open are answered 503 by webview_destroy.
+    // open are answered by webview_destroy (Windows: 503; macOS: released).
     if (this.#requestCallback) {
       (requestLib ??= openRequestLib()).symbols.webview_set_request_handler(
         this.#handle,
@@ -359,14 +375,22 @@ export class Webview {
    * @param data The bytes; a string is encoded as UTF-8.
    */
   setAsset(path: string, mime: string, data: Uint8Array | string) {
+    // Bound first; every buffer goes in as a typed array, which Bun keeps
+    // alive for the call (see encodeCString).
+    const symbols = (forkLib ??= openForkLib()).symbols;
     const bytes =
       typeof data === "string" ? new TextEncoder().encode(data) : data;
-    (forkLib ??= openForkLib()).symbols.webview_set_asset(
-      this.#handle,
-      encodeCString(path),
-      encodeCString(mime),
-      ptr(bytes),
-      BigInt(bytes.byteLength),
+    const pathBuf = encodeCString(path);
+    const mimeBuf = encodeCString(mime);
+    check(
+      "webview_set_asset",
+      symbols.webview_set_asset(
+        this.#handle,
+        pathBuf,
+        mimeBuf,
+        bytes.byteLength > 0 ? bytes : null,
+        BigInt(bytes.byteLength),
+      ),
     );
   }
 
@@ -415,17 +439,21 @@ export class Webview {
    * {@link completeWebviewRequest}.
    *
    * Pass `null` to remove the handler; requests already handed to it stay
-   * open until completed or until the webview is destroyed (which answers
-   * them 503).
+   * open until completed or until the webview is destroyed. Destroying it
+   * answers them `503` on Windows; on macOS the tasks are released unanswered
+   * and WebKit stops them.
    *
-   * Windows: WebView2's `WebResourceRequested`, deferred until completed.
-   * macOS: a `WKURLSchemeHandler` for the schemes `webview` and
+   * Windows: WebView2's `WebResourceRequested`, deferred until completed;
+   * requests from service workers are caught too (WebView2 Runtime 125 or
+   * later). macOS: a `WKURLSchemeHandler` for the schemes `webview` and
    * `webview-frames`. Linux: accepted; not served.
    *
    * ## Example
    *
+   * Synchronous, so it works while {@link Webview.run} blocks the thread:
+   *
    * ```ts
-   * webview.setRequestHandler(async (req) => {
+   * webview.setRequestHandler((req) => {
    *   const { pathname } = new URL(req.url);
    *   if (pathname === "/api/time") {
    *     return {
@@ -437,6 +465,10 @@ export class Webview {
    * });
    * webview.navigate(`${webview.assetOrigin}/index.html`);
    * ```
+   *
+   * For async work (`fetch`, files, a database), return nothing, post
+   * `{ handle: webview.unsafeHandle, request }` to a `Worker`, and answer
+   * there with {@link completeWebviewRequest}; see `docs/requests.md`.
    */
   setRequestHandler(handler: RequestHandler | null) {
     const symbols = (requestLib ??= openRequestLib()).symbols;
@@ -526,8 +558,9 @@ export class Webview {
   /**
    * Answers a request handed to the {@link Webview.setRequestHandler request handler}.
    * Safe to call from any thread, including after the handler returned. The
-   * headers and body are copied before this returns. Completing a request
-   * twice, or one the browser has since cancelled, does nothing.
+   * headers are checked and the headers and body copied before this returns;
+   * bad headers throw a {@link WebviewError}. Completing a request twice, or
+   * one the browser has since cancelled, does nothing.
    *
    * @param id The request's {@link WebviewRequest.id}.
    */

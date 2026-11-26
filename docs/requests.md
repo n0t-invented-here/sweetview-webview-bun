@@ -45,12 +45,39 @@ The handler gets a `WebviewRequest`:
 It answers in one of two ways:
 
 - Return a `WebviewResponse`: `{ status?, headers?, body? }`. `status` defaults to 200. `headers` is
-  an object or `[name, value]` pairs (pairs let `Set-Cookie` repeat). `body` is a string (UTF-8),
+  an object or `[name, value]` pairs (pairs let a name repeat). `body` is a string (UTF-8),
   `Uint8Array` or `ArrayBuffer`.
 - Return nothing and call `completeRequest(req.id, response)` later.
 
 A handler that throws answers 500. The request stays open until it is answered, and the page waits
-for it. When the webview is destroyed, requests still open are answered 503.
+for it. What happens to requests still open when the webview is destroyed depends on the platform:
+
+| Platform | Open requests at destroy                                                        |
+| -------- | ------------------------------------------------------------------------------- |
+| Windows  | Answered `503 Service Unavailable`, then the WebView2 deferral is completed     |
+| macOS    | The `WKURLSchemeTask`s are released unanswered; WebKit stops them as it closes |
+
+A request whose body cannot be read in full never reaches the handler: Windows answers it 500, macOS
+fails it with the stream's error.
+
+### Response headers
+
+Checked before the call returns; a bad set throws a `WebviewError` with code -2
+(`WEBVIEW_ERROR_INVALID_ARGUMENT`) and answers nothing, so the request stays open for a good answer.
+
+- Each name must be an RFC 9110 token: not empty, no spaces, `:`, `(`, `"` or non-ASCII.
+- Each value must be free of CR, LF, NUL and other control characters but tab. Nothing is stripped
+  or rewritten, so nothing can be injected.
+
+Repeated names go out differently per platform:
+
+| Platform | Repeated names                                                                                                                                                          |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Windows  | Each pair is its own header line; several `Set-Cookie` headers work                                                                                                     |
+| macOS    | `NSHTTPURLResponse` holds one value per name: names match regardless of case, repeats are joined with `", "`, and only the first `Set-Cookie` is kept (it cannot be joined) |
+
+So on macOS a response carries **at most one `Set-Cookie`**. Use a combinable header (`X-Multi: a`
+and `X-Multi: b` arrive as `a, b`) when a value must repeat on both platforms.
 
 ### Async work goes on a worker
 
@@ -78,11 +105,32 @@ self.onmessage = async ({ data: { handle, req } }) => {
 };
 ```
 
+### Shutting the worker down
+
+`run()` destroys the webview when it returns. A worker may still be answering then:
+
+- `completeWebviewRequest` against a destroyed webview throws a `WebviewError` with code -3
+  (`WEBVIEW_ERROR_INVALID_STATE`). The library keeps a registry of live webviews and checks the
+  handle against it under a lock, so a late call is refused rather than touching freed memory, from
+  any thread.
+- An answer queued just before the destroy does nothing when it runs.
+- Still stop the worker after `run()` returns, and catch the error in the worker if it may answer
+  late:
+
+```typescript
+webview.run(); // destroys the webview on return
+worker.terminate();
+```
+
 ## `completeRequest(id, response)` and `completeWebviewRequest(handle, id, response)`
 
-Answer a request handed to the handler. The headers and body are copied before the call returns.
+Answer a request handed to the handler. The headers are checked (see
+[Response headers](#response-headers)) and the headers and body copied before the call returns.
 Answering a request twice, or one the browser cancelled, does nothing. `completeWebviewRequest` is
 the same thing as a free function that takes the webview's `unsafeHandle`, for workers.
+
+Both throw a `WebviewError`: -2 for bad headers, a status outside 100-599 or a body over 4 GiB - 1;
+-3 once the webview is destroyed or being destroyed.
 
 ## `framesOrigin`
 
@@ -92,9 +140,14 @@ the page cannot read the frame's document, and the two talk through `postMessage
 
 | Platform | `assetOrigin`              | `framesOrigin`                    | How                                                    |
 | -------- | -------------------------- | --------------------------------- | ------------------------------------------------------ |
-| Windows  | `http://webview.localhost` | `http://frames.webview.localhost` | WebView2's `WebResourceRequested`, deferred            |
+| Windows  | `http://webview.localhost` | `http://frames.webview.localhost` | WebView2's `WebResourceRequested`, deferred (\*)       |
 | macOS    | `webview://localhost`      | `webview-frames://localhost`      | A `WKURLSchemeHandler` for `webview`, `webview-frames` |
 | Linux    |                            |                                   | Accepted; not served                                   |
+
+(\*) Requests from service workers and shared workers are caught too, with
+`AddWebResourceRequestedFilterWithRequestSourceKinds`, on WebView2 Runtime 125 or later; an older
+Runtime reports only document requests. A response WebView2 refuses to build goes out as a bare 500,
+never on to the network.
 
 ## `setAllowExternalDrop(allow)`
 
@@ -111,4 +164,7 @@ the library refuses a call.
 
 `bun test` opens a real webview and checks all of the above end to end: dynamic HTML, a `POST` with
 a body and a custom header answered from a worker, a binary image, a cross-origin `<iframe>` from
-`framesOrigin`, and that `setAsset` assets still answer first.
+`framesOrigin`, that `setAsset` assets still answer first, a service worker's own `fetch` reaching
+the handler, bad response headers (`{"X-Example":trueish}`, an escaped NUL, a name with a space, a
+lone surrogate, CR LF) refused with -2, and `completeWebviewRequest` after the webview is destroyed
+refused with -3 from the main thread and from a worker.

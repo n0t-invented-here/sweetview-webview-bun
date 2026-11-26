@@ -1,7 +1,7 @@
 // The request handler, the frames origin and external drop, against the
 // shipped library in build/. The live part opens a real webview (WebView2 on
 // Windows) in a child process; nothing listens on a socket.
-import { dlopen, FFIType } from "bun:ffi";
+import { dlopen, FFIType, type Pointer } from "bun:ffi";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,13 +41,26 @@ describe("library exports", () => {
     // A null webview is refused, not dereferenced: WEBVIEW_ERROR_INVALID_ARGUMENT (-2).
     expect(lib.symbols.webview_set_allow_external_drop(null, 1)).toBe(-2);
     expect(lib.symbols.webview_set_request_handler(null, null, null)).toBe(-2);
-    // request_id 0 and an out-of-range status are rejected before the webview is touched.
+    // A null webview is refused before anything else is looked at.
     expect(
       lib.symbols.webview_complete_request(null, 0n, 200, null, null, 0n),
     ).toBe(-2);
     expect(
       lib.symbols.webview_complete_request(null, 1n, 42, null, null, 0n),
     ).toBe(-2);
+    // A handle that never came from webview_create (or was destroyed) is
+    // looked up in the live-instance registry and refused, never
+    // dereferenced: WEBVIEW_ERROR_INVALID_STATE (-3).
+    expect(
+      lib.symbols.webview_complete_request(
+        0x1000 as unknown as Pointer,
+        1n,
+        200,
+        null,
+        null,
+        0n,
+      ),
+    ).toBe(-3);
     lib.close();
   });
 });
@@ -116,10 +129,24 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(p.echo.query).toBe("?x=1");
       expect(p.echo.header).toBe('hello "world"');
       expect(JSON.parse(p.echo.body)).toEqual({ ping: "pong", n: 42 });
-      // Repeated headers survive; CR/LF cannot inject a header.
+      // Repeated headers survive.
       expect(p.echoMulti).toBe("a, b");
+      // Bad header JSON is refused with WEBVIEW_ERROR_INVALID_ARGUMENT (-2)
+      // before anything is queued, and the request stays open for the real
+      // answer: trailing text after a literal ({"X-Example":trueish}), an
+      // escaped NUL, a name that is not a token, a lone surrogate, a raw tab
+      // inside a string, CR LF in a value.
+      expect(p.rawRejections).toBe("-2,-2,-2,-2,-2,-2");
+      // The same through completeWebviewRequest, which throws WebviewError.
+      expect(p.wrapperRejections).toBe("-2,-2,-2,-2");
+      // Nothing was injected.
       expect(p.echoInjected).toBeNull();
-      expect(p.echoEvil).toBe("okX-Injected: yes");
+      expect(p.echoEvil).toBeNull();
+
+      // A service worker's own fetch reaches the handler, not the network.
+      expect(p.sw).toEqual({ status: 200, text: "sw-ok" });
+      expect(paths).toContain("/sw.js");
+      expect(paths).toContain("/from-sw");
 
       // Binary image completed from a worker thread.
       expect(p.imgEvent).toBe("load");
@@ -139,6 +166,12 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       // A request still open when the webview is destroyed is answered and released.
       expect(r.neverOpened).toBe(true);
       expect(paths).toContain("/never");
+
+      // After webview_destroy, completing against the stale handle is
+      // refused with WEBVIEW_ERROR_INVALID_STATE (-3) instead of crashing,
+      // from the main thread and from a worker, wrapper and raw call alike.
+      expect(r.afterDestroyMain).toBe(-3);
+      expect(r.afterDestroyWorker).toEqual({ wrapper: -3, raw: -3 });
     }, 90_000);
   },
 );

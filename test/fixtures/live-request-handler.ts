@@ -4,7 +4,12 @@
 // No sockets: every response comes from WebResourceRequested (Windows) or a
 // WKURLSchemeHandler (macOS).
 import { lib } from "../../src/ffi";
-import { Webview, type WebviewRequest } from "../../src/index";
+import {
+  completeWebviewRequest,
+  Webview,
+  WebviewError,
+  type WebviewRequest,
+} from "../../src/index";
 
 const webview = new Webview(false, { width: 800, height: 600, hint: 0 });
 const handle = webview.unsafeHandle;
@@ -73,6 +78,8 @@ const page = `<!doctype html>
     r.echoMulti = resp.headers.get("x-multi");
     r.echoInjected = resp.headers.get("x-injected");
     r.echoEvil = resp.headers.get("x-evil");
+    r.rawRejections = resp.headers.get("x-raw-rejections");
+    r.wrapperRejections = resp.headers.get("x-wrapper-rejections");
     r.echo = await resp.json();
 
     const img = document.getElementById("img");
@@ -94,6 +101,25 @@ const page = `<!doctype html>
     }
 
     r.missingStatus = (await fetch("/nothing-here")).status;
+
+    // A service worker's own fetch must reach the handler too (WebView2:
+    // the filter covers every request source kind), never the network.
+    try {
+      const reply = new Promise((res) => {
+        navigator.serviceWorker.addEventListener("message", (e) => res(e.data));
+      });
+      navigator.serviceWorker.startMessages();
+      const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      r.swScope = reg.scope;
+      const ready = await navigator.serviceWorker.ready;
+      ready.active.postMessage("go");
+      r.sw = await Promise.race([
+        reply,
+        new Promise((res) => setTimeout(() => res({ timeout: true }), 15000)),
+      ]);
+    } catch (e) {
+      r.sw = { error: String(e) };
+    }
     // Left open on purpose: destroying the webview must answer and release it.
     fetch("/never").catch(() => {});
   } catch (e) {
@@ -103,6 +129,21 @@ const page = `<!doctype html>
 })();
 </script>
 </body></html>`;
+
+// Fetches /from-sw from inside the service worker when the page asks, and
+// sends back what it got.
+const serviceWorker = `
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener("message", (e) => {
+  e.waitUntil(
+    fetch("/from-sw?via=service-worker")
+      .then(async (r) => ({ status: r.status, text: await r.text() }))
+      .catch((err) => ({ error: String(err) }))
+      .then((result) => e.source.postMessage(result)),
+  );
+});
+`;
 
 const sandbox = `<!doctype html><html><body>sandbox
 <script>parent.postMessage({ origin: window.origin, href: location.href }, "*");</script>
@@ -134,6 +175,18 @@ webview.setRequestHandler((req: WebviewRequest) => {
     worker.postMessage({ handle: Number(handle), request: req });
     return;
   }
+  if (!isFrames && url.pathname === "/sw.js") {
+    return {
+      headers: { "Content-Type": "text/javascript; charset=utf-8" },
+      body: serviceWorker,
+    };
+  }
+  if (!isFrames && url.pathname === "/from-sw") {
+    return {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: "sw-ok",
+    };
+  }
   if (!isFrames && url.pathname === "/never") {
     // Never answered; webview_destroy answers it 503 and releases it.
     report.neverOpened = true;
@@ -158,7 +211,22 @@ webview.bind("report", (json: string) => {
 });
 
 webview.navigate(`${origin}/dynamic`);
-webview.run();
+webview.run(); // destroys the webview when it returns
+
+// After webview_destroy: completing against the stale handle is refused with
+// WEBVIEW_ERROR_INVALID_STATE (-3), on this thread and on the worker's.
+try {
+  completeWebviewRequest(handle, 1n, { status: 200, body: "late" });
+  report.afterDestroyMain = 0;
+} catch (e) {
+  report.afterDestroyMain = e instanceof WebviewError ? e.code : String(e);
+}
+report.afterDestroyWorker = await new Promise((resolve) => {
+  worker.onmessage = (e) => {
+    if (e.data?.afterDestroy) resolve(e.data.afterDestroy);
+  };
+  worker.postMessage({ handle: Number(handle), afterDestroy: { id: "1" } });
+});
 worker.terminate();
 console.log("RESULT " + JSON.stringify(report));
 process.exit(0);

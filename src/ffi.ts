@@ -1,8 +1,15 @@
-import { dlopen, FFIType, ptr } from "bun:ffi";
+import { dlopen, FFIType } from "bun:ffi";
 import { Webview } from "./webview";
 
-export function encodeCString(value: string) {
-  return ptr(new TextEncoder().encode(value + "\0"));
+/**
+ * A NUL-terminated UTF-8 copy of `value`, to pass straight as an
+ * `FFIType.ptr` argument. Returned as the typed array, not a numeric
+ * `ptr(...)`: Bun keeps a typed array argument alive for the call, while a
+ * bare pointer to a temporary array can be collected (and its memory reused)
+ * by any allocation before the call, such as a lazy `dlopen`.
+ */
+export function encodeCString(value: string): Uint8Array {
+  return new TextEncoder().encode(value + "\0");
 }
 
 export const instances: Webview[] = [];
