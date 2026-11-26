@@ -165,6 +165,24 @@ describe.if(process.platform === "win32" || process.platform === "darwin")(
       expect(p.frameHref).toBe(`${frames}/sandbox.html`);
       expect(String(p.frameDocumentAccess)).toStartWith("blocked:");
 
+      // Seen from inside the iframe: no bridge and no bound functions...
+      const f = p.frameProbe;
+      expect(f.error).toBeUndefined();
+      expect(f.hasBridge).toBe(false);
+      // ...no access to the parent document...
+      expect(f.parentDocBlocked).toBe("SecurityError");
+      // ...no CORS read of the main origin...
+      expect(f.crossOriginFetchBlocked).toBe("blocked");
+      // ...raw RPC posts to the native channels never run a host binding...
+      expect(Array.isArray(f.rawPostAttempted)).toBe(true);
+      expect(r.iframeEscaped).toBe(false);
+      // ...and its own origin's subresources still load.
+      expect(f.subresourceStatus).toBe(200);
+      expect(f.subresourceLoaded).toEqual({ frameData: "frame-ok" });
+      expect(r.requests.map((q: { url: string }) => q.url)).toContain(
+        `${frames}/frame-data.json`,
+      );
+
       // Unknown paths reach the handler, which answers 404.
       expect(p.missingStatus).toBe(404);
       expect(paths).toContain("/nothing-here");

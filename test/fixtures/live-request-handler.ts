@@ -94,6 +94,7 @@ const page = `<!doctype html>
     r.frameEventOrigin = msg.eventOrigin;
     r.frameOrigin = msg.data.origin;
     r.frameHref = msg.data.href;
+    r.frameProbe = msg.data;
     try {
       r.frameDocumentAccess = typeof document.getElementById("frame").contentWindow.document;
     } catch (e) {
@@ -149,8 +150,64 @@ self.addEventListener("message", (e) => {
 });
 `;
 
+// Runs inside the cross-origin iframe: checks it got no bridge, cannot reach
+// the parent or the main origin, cannot call a host binding by posting raw
+// RPC messages, and can still load its own origin's subresources. Reports to
+// the parent with postMessage.
 const sandbox = `<!doctype html><html><body>sandbox
-<script>parent.postMessage({ origin: window.origin, href: location.href }, "*");</script>
+<script>
+(async () => {
+  const r = { origin: window.origin, href: location.href };
+  try {
+    r.hasBridge =
+      typeof window.__webview__ !== "undefined" ||
+      typeof window.iframeProbe !== "undefined" ||
+      typeof window.report !== "undefined";
+    try {
+      void parent.document;
+      r.parentDocBlocked = "allowed";
+    } catch (e) {
+      r.parentDocBlocked = e.name;
+    }
+    try {
+      await fetch(${JSON.stringify(origin)} + "/asset.txt");
+      r.crossOriginFetchBlocked = "allowed";
+    } catch {
+      r.crossOriginFetchBlocked = "blocked";
+    }
+    // Raw RPC posts straight to the native channels, bypassing __webview__.
+    // The host must never run iframeProbe for them.
+    const probe = JSON.stringify({ id: "999", method: "iframeProbe", params: [] });
+    r.rawPostAttempted = [];
+    try {
+      if (window.chrome?.webview?.postMessage) {
+        window.chrome.webview.postMessage(probe);
+        r.rawPostAttempted.push("chrome.webview");
+      }
+    } catch (e) {
+      r.rawPostAttempted.push("chrome.webview:" + e.name);
+    }
+    try {
+      if (window.webkit?.messageHandlers?.__webview__?.postMessage) {
+        window.webkit.messageHandlers.__webview__.postMessage(probe);
+        r.rawPostAttempted.push("webkit");
+      }
+    } catch (e) {
+      r.rawPostAttempted.push("webkit:" + e.name);
+    }
+    try {
+      const resp = await fetch("/frame-data.json");
+      r.subresourceStatus = resp.status;
+      r.subresourceLoaded = await resp.json();
+    } catch (e) {
+      r.subresourceLoaded = "error:" + e;
+    }
+  } catch (e) {
+    r.error = String(e && e.stack || e);
+  }
+  parent.postMessage(r, "*");
+})();
+</script>
 </body></html>`;
 
 webview.setRequestHandler((req: WebviewRequest) => {
@@ -162,6 +219,13 @@ webview.setRequestHandler((req: WebviewRequest) => {
     return {
       headers: { "Content-Type": "text/html; charset=utf-8" },
       body: sandbox,
+    };
+  }
+  if (isFrames && url.pathname === "/frame-data.json") {
+    // Served to the frames origin only: the iframe's own subresource.
+    return {
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ frameData: "frame-ok" }),
     };
   }
   if (!isFrames && url.pathname === "/dynamic") {
@@ -205,9 +269,16 @@ webview.setRequestHandler((req: WebviewRequest) => {
 function finishWhenDone() {
   if (report.page && report.neverOpened) {
     report.requests = seen;
+    report.iframeEscaped = iframeEscaped;
     lib.symbols.webview_terminate(handle);
   }
 }
+
+// Never called: the iframe's raw RPC posts must not reach host bindings.
+let iframeEscaped = false;
+webview.bind("iframeProbe", () => {
+  iframeEscaped = true;
+});
 
 webview.bind("report", (json: string) => {
   report.page = JSON.parse(json);
