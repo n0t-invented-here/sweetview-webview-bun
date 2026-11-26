@@ -331,9 +331,10 @@ The library is built from the `webview/` submodule (sweetview-webview) and check
 | `build/libwebview.dylib`    | Current source, on macOS (arm64 + x86_64)    | Yes                                                                             |
 | `build/libwebview-x64.so`   | An older fork commit                         | No (and Linux implements none of them; see below)                               |
 
-The dylib is built on macOS 27 with no deployment target set, so it declares macOS 27.0 as its
-minimum; the x86_64 half is compiled and linked but has not been run (the build machine is arm64
-without Rosetta).
+`just build` builds the dylib with Apple Clang and the SDK's libc++ (`/usr/bin/clang`, whatever
+`clang` is first on `PATH`), universal, with a deployment target of macOS 11.0: both slices declare
+11.0 as their minimum and import only C++ runtime symbols that system has. A newer LLVM's libc++
+headers would make it import `std::__hash_memory`, which only the newest macOS provides.
 
 Assets, background color, the input hooks and permissions are in all three. Each 2.8.0 feature is
 bound lazily and on its own, so a binary without one still serves everything else; calling a missing

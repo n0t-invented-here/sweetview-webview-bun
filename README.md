@@ -162,11 +162,15 @@ Please use `bun pretty` to automatically format all files.
 - Fedora-based: `sudo dnf install gtk4-devel webkitgtk6.0-devel cmake ninja-build clang`
 - Arch-based: `sudo pacman -S cmake ninja clang`
 
-#### 🍎 On macOS, you need following deps:
+#### 🍎 On macOS, you need the Xcode Command Line Tools, CMake and Ninja:
 
 ```bash
-brew install cmake ninja clang
+xcode-select --install
+brew install cmake ninja
 ```
+
+The dylib is built with Apple Clang (`/usr/bin/clang`) whatever `clang` is first on `PATH`, as a
+universal binary (arm64 + x86_64) for macOS 11.0 and later.
 
 ### Building
 
